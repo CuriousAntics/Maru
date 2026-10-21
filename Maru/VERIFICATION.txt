@@ -1,0 +1,15 @@
+Maru starter verification — October 21, 2026
+
+Passed locally with Node.js 24.19.0:
+- Dependency installation completed; package-lock.json included.
+- npm run check
+- npm run build
+- Starting without credentials exits with code 1 and a credential-free error message.
+
+Not exercised:
+- Discord login, test command registration, or /ping response.
+- A live PostgreSQL connection.
+- Railway or Docker build/deployment.
+- GitHub Actions execution.
+
+These require connected services or runtime facilities. This package has not been pushed to CuriousAntics/Maru. Preserve the repository's current content when applying it. The included README replaces the initial placeholder README only after review.
