@@ -39,6 +39,9 @@ export function logoutProof(token: string): string {
 export function settingsProof(token: string): string {
   return createHmac('sha256', token).update('maru-dashboard-settings').digest('base64url');
 }
+export function testLogProof(token: string, requestId: string, channelId: string): string {
+  return createHmac('sha256', token).update(`maru-test-log:${requestId}:${channelId}`).digest('base64url');
+}
 export function cookieName(kind: 'login' | 'session', secure: boolean): string {
   return `${secure ? '__Host-' : ''}maru_${kind}`;
 }

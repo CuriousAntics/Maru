@@ -7,7 +7,7 @@ import { handleStaffAccess } from './handle-staff-access.js';
 import { createDashboardHandler } from './dashboard.js';
 import { dashboardConfig } from './web-security.js';
 import { Routes } from 'discord.js';
-import type { RESTGetAPIGuildMemberResult } from 'discord.js';
+import type { RESTGetAPIGuildMemberResult, RESTPostAPIChannelMessageResult } from 'discord.js';
 
 async function main(): Promise<void> {
   const token = required('DISCORD_TOKEN');
@@ -29,6 +29,12 @@ async function main(): Promise<void> {
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
     isBotReady: () => !stopping && client.isReady(),
+    sendTestMessage: async (channelId, body) => {
+      const message = await client.rest.post(Routes.channelMessages(channelId), {
+        body, signal: AbortSignal.timeout(15000),
+      }) as RESTPostAPIChannelMessageResult;
+      return { id: message.id, channel_id: message.channel_id };
+    },
     readLogChannels: async () => {
       const guild = await client.guilds.fetch(guildId);
       await guild.roles.fetch();

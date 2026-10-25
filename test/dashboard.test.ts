@@ -5,8 +5,9 @@ import type { AddressInfo } from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import type { Pool } from 'pg';
+import type { RESTPostAPIChannelMessageJSONBody } from 'discord.js';
 import { createDashboardHandler } from '../src/dashboard.js';
-import { cookie, dashboardConfig, digest, logoutProof, settingsProof, randomToken } from '../src/web-security.js';
+import { cookie, dashboardConfig, digest, logoutProof, settingsProof, testLogProof, randomToken } from '../src/web-security.js';
 
 const db = new PGlite();
 const guild = '100000000000000001';
@@ -14,8 +15,11 @@ const user = '300000000000000001';
 const adminRole = '200000000000000001';
 const modRole = '200000000000000002';
 let failSettingsAudit = false;
+let failTestAudit: 'request' | 'result' | undefined;
 async function query(sql: string, values?: unknown[]) {
   if (failSettingsAudit && sql.includes("'SERVER_SETTINGS_CHANGED'")) throw new Error('test audit write failure');
+  if (failTestAudit === 'request' && sql.includes("'TEST_LOG_REQUESTED',")) throw new Error('test request audit failure');
+  if (failTestAudit === 'result' && values?.[2] && String(values[2]).startsWith('TEST_LOG_')) throw new Error('test result audit failure');
   const result = await db.query(sql, values);
   return { rows: result.rows, rowCount: result.rows.length || result.affectedRows || 0 };
 }
@@ -23,6 +27,7 @@ const pool = { query, async connect() { return { query, release() {} }; } } as u
 let base = '';
 let roles: string[] | null;
 let memberFailure = false;
+let botReady = true;
 let memberReadHook: (() => Promise<void>) | undefined;
 let exchangeFailure = false;
 let exchanges = 0;
@@ -31,6 +36,9 @@ const channelId = '500000000000000001';
 const secondChannel = '500000000000000002';
 let channels = [{ id: channelId, name: 'logs', usable: true }, { id: secondChannel, name: 'staff-logs', usable: true }];
 let channelFailure = false;
+let sendFailure: 'network' | 'forbidden' | 'invalid' | undefined;
+let sends: { channelId: string; body: RESTPostAPIChannelMessageJSONBody }[] = [];
+const messageId = '600000000000000001';
 const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
   if (String(url).endsWith('/oauth2/token/revoke')) return new Response('{}');
   if (String(url).endsWith('/oauth2/token')) {
@@ -49,9 +57,15 @@ function makeHandler(configured = true) {
   return createDashboardHandler({
     pool, guildId: guild,
     config: configured ? { origin: base, secure: false, applicationId: '400000000000000001', clientSecret: 'test-only' } : undefined,
-    isBotReady: () => true,
+    isBotReady: () => botReady,
     readMemberRoles: async () => { await memberReadHook?.(); if (memberFailure) throw new Error('Discord unavailable'); return roles; },
     readLogChannels: async () => { if (channelFailure) throw new Error('channel lookup failed'); return channels; },
+    sendTestMessage: async (destination, body) => {
+      sends.push({ channelId: destination, body });
+      if (sendFailure === 'network') throw new Error('private network diagnostic');
+      if (sendFailure === 'forbidden') throw Object.assign(new Error('private Discord detail'), { status: 403 });
+      return { id: sendFailure === 'invalid' ? 'invalid' : messageId, channel_id: destination };
+    },
     fetcher,
   });
 }
@@ -68,6 +82,7 @@ before(async () => {
 });
 beforeEach(async () => {
   failSettingsAudit = false; channelFailure = false; memberReadHook = undefined;
+  failTestAudit = undefined; sendFailure = undefined; sends = []; botReady = true;
   channels = [{ id: channelId, name: 'logs', usable: true }, { id: secondChannel, name: 'staff-logs', usable: true }];
   roles = [adminRole]; memberFailure = false; exchangeFailure = false; exchanges = 0; displayName = 'Miranda';
   await db.exec('TRUNCATE dashboard_login_attempts, dashboard_sessions, audit_events, staff_access_grants, staff_roles, guild_settings RESTART IDENTITY');
@@ -319,7 +334,7 @@ test('Admin can choose channels and needs a reason', async () => {
   const body = await response.text();
   assert.equal(response.headers.get('referrer-policy'), 'same-origin');
   assert.match(body, /#logs/); assert.match(body, /Save settings/); assert.match(body, /name="reason" required/);
-  assert.match(body, /Log delivery is not active yet/);
+  assert.match(body, /Automatic moderation logs are not active yet/);
 });
 test('ordinary Mod sees settings but cannot submit changes', async () => {
   roles = [modRole];
@@ -461,4 +476,223 @@ test('overview displays the previous and new log destinations', async () => {
   const session = await signIn(); await saveSettings(session);
   const body = await (await request('/dashboard', { headers: { cookie: session } })).text();
   assert.ok(body.includes(`Moderation log channel: Not configured → ${channelId}`));
+});
+
+async function configureLog(session: string) {
+  assert.equal((await saveSettings(session)).status, 303);
+}
+async function testForm(session: string) {
+  const response = await request('/settings', { headers: { cookie: session } });
+  const html = await response.text();
+  const form = html.match(/<form method="post" action="\/settings\/test-log">([\s\S]*?)<\/form>/)?.[1];
+  assert.ok(form, 'test log form is present');
+  const fields: Record<string, string> = {};
+  for (const match of form.matchAll(/name="([^"]+)" value="([^"]*)"/g)) fields[match[1]!] = match[2]!;
+  return fields;
+}
+async function postTest(session: string, fields: Record<string, string>, headers: Record<string, string> = {}) {
+  return request('/settings/test-log', { method: 'POST', headers: {
+    cookie: session, origin: base, 'Content-Type': 'application/x-www-form-urlencoded', ...headers,
+  }, body: new URLSearchParams(fields) });
+}
+async function testEvents() {
+  return (await db.query<{ event_type: string; actor_id: string; details: Record<string, unknown> }>(
+    "SELECT event_type, actor_id, details FROM audit_events WHERE event_type LIKE 'TEST_LOG_%' ORDER BY event_id")).rows;
+}
+async function resultText(response: Response, session: string) {
+  assert.equal(response.status, 303);
+  return (await request(response.headers.get('location')!, { headers: { cookie: session } })).text();
+}
+
+test('test delivery button appears only after a usable destination is saved', async () => {
+  const session = await signIn();
+  let html = await (await request('/settings', { headers: { cookie: session } })).text();
+  assert.ok(!html.includes('action="/settings/test-log"'));
+  await configureLog(session); assert.ok((await testForm(session)).csrf);
+  channels[0]!.usable = false;
+  html = await (await request('/settings', { headers: { cookie: session } })).text();
+  assert.ok(!html.includes('action="/settings/test-log"'));
+});
+test('test delivery requires a session and POST', async () => {
+  assert.equal((await request('/settings/test-log', { method: 'POST' })).status, 303);
+  assert.equal((await request('/settings/test-log')).status, 405);
+  assert.equal(sends.length, 0);
+});
+test('Admin sends one embed with mentions disabled and records request plus confirmation', async () => {
+  const session = await signIn(); await configureLog(session);
+  const fields = await testForm(session);
+  const text = await resultText(await postTest(session, fields), session);
+  assert.match(text, /Discord confirmed delivery/);
+  assert.equal(sends.length, 1); assert.equal(sends[0]!.channelId, channelId);
+  const body = sends[0]!.body;
+  assert.deepEqual(body.allowed_mentions, { parse: [] });
+  assert.equal(body.enforce_nonce, true); assert.equal(String(body.nonce).length, 25);
+  assert.equal(body.embeds?.[0]?.title, 'Maru log delivery test');
+  assert.match(body.embeds![0]!.description!, /No moderation action was performed/);
+  const events = await testEvents();
+  assert.deepEqual(events.map((event) => event.event_type), ['TEST_LOG_REQUESTED', 'TEST_LOG_SENT']);
+  assert.ok(events.every((event) => event.actor_id === user && event.details.channel_id === channelId && event.details.request_id === fields.request_id));
+  assert.equal(events[1]!.details.message_id, messageId);
+});
+test('ordinary Mods cannot see or invoke the test button', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  roles = [modRole];
+  const html = await (await request('/settings', { headers: { cookie: session } })).text();
+  assert.ok(!html.includes('action="/settings/test-log"'));
+  assert.equal((await postTest(session, fields)).status, 403); assert.equal(sends.length, 0);
+});
+test('full-access Mod can send a test log', async () => {
+  const session = await signIn(); await configureLog(session);
+  roles = [modRole];
+  await pool.query('INSERT INTO staff_access_grants (guild_id, user_id, granted_by) VALUES ($1,$2,$3)', [guild, user, user]);
+  assert.equal((await postTest(session, await testForm(session))).status, 303); assert.equal(sends.length, 1);
+});
+test('test delivery rejects wrong origins, null origin, content type, and unrelated CSRF proofs', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  for (const origin of ['https://invalid.example', 'null', '']) {
+    assert.equal((await postTest(session, fields, { origin })).status, 403);
+  }
+  assert.equal((await postTest(session, fields, { 'Content-Type': 'text/plain' })).status, 403);
+  assert.equal((await postTest(session, { ...fields, csrf: settingsProof(session.split('=')[1]!) })).status, 403);
+  assert.equal((await postTest(session, { ...fields, channel_id: secondChannel })).status, 403);
+  assert.equal(sends.length, 0); assert.equal((await testEvents()).length, 0);
+});
+test('test delivery rejects duplicate, unknown, oversized, and malformed fields', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  assert.equal((await postTest(session, { ...fields, request_id: 'invalid' })).status, 400);
+  assert.equal((await postTest(session, { ...fields, extra: 'unexpected' })).status, 400);
+  assert.equal((await postTest(session, { ...fields, csrf: 'x'.repeat(1200) })).status, 413);
+  const body = new URLSearchParams(fields); body.append('channel_id', channelId);
+  assert.equal((await request('/settings/test-log', { method: 'POST', headers: {
+    cookie: session, origin: base, 'Content-Type': 'application/x-www-form-urlencoded',
+  }, body })).status, 400);
+  assert.equal(sends.length, 0);
+});
+test('expired session cannot send a test', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  await db.exec("UPDATE dashboard_sessions SET expires_at = NOW() - INTERVAL '1 minute'");
+  assert.equal((await postTest(session, fields)).status, 303); assert.equal(sends.length, 0);
+});
+test('lost roles and revoked grants block an open test form', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  roles = [modRole];
+  assert.equal((await postTest(session, fields)).status, 403);
+  roles = [];
+  assert.equal((await postTest(session, fields)).status, 403);
+  assert.equal(sends.length, 0);
+});
+test('test delivery rechecks access inside its claim transaction', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  let reads = 0; memberReadHook = async () => { if (++reads === 2) roles = []; };
+  assert.equal((await postTest(session, fields)).status, 403);
+  assert.equal(reads, 2); assert.equal(sends.length, 0); assert.equal((await testEvents()).length, 0);
+});
+test('changed or cleared destination does not redirect an old test to another channel', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  await saveSettings(session, { channel_id: secondChannel, previous_channel_id: channelId });
+  assert.equal((await postTest(session, fields)).status, 409);
+  await saveSettings(session, { channel_id: '', previous_channel_id: secondChannel });
+  assert.equal((await postTest(session, fields)).status, 409); assert.equal(sends.length, 0);
+});
+test('deleted channel or missing permissions blocks test delivery', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  channels[0]!.usable = false;
+  assert.equal((await postTest(session, fields)).status, 409);
+  channels = [];
+  assert.equal((await postTest(session, fields)).status, 409); assert.equal(sends.length, 0);
+});
+test('Discord channel validation failure cannot dispatch a test', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  channelFailure = true;
+  assert.equal((await postTest(session, fields)).status, 503);
+  assert.equal(sends.length, 0); assert.equal((await testEvents()).length, 0);
+});
+test('resubmitting the same test and refreshing its result never resends', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  const response = await postTest(session, fields);
+  await resultText(response, session); await resultText(response, session);
+  handler = makeHandler();
+  assert.match(await resultText(await postTest(session, fields), session), /Discord confirmed delivery/);
+  assert.equal(sends.length, 1); assert.equal((await testEvents()).length, 2);
+});
+test('per-server cooldown survives handler restart and allows a later new test', async () => {
+  const session = await signIn(); await configureLog(session);
+  await postTest(session, await testForm(session)); handler = makeHandler();
+  const fields = await testForm(session);
+  assert.match(await resultText(await postTest(session, fields), session), /wait 30 seconds/);
+  assert.equal(sends.length, 1);
+  await db.exec("UPDATE audit_events SET created_at = NOW() - INTERVAL '31 seconds' WHERE event_type = 'TEST_LOG_REQUESTED'");
+  assert.match(await resultText(await postTest(session, fields), session), /Discord confirmed delivery/);
+  assert.equal(sends.length, 2); assert.equal((await testEvents()).length, 4);
+});
+test('Discord rejection is recorded without falsely reporting delivery', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  sendFailure = 'forbidden';
+  assert.match(await resultText(await postTest(session, fields), session), /Discord rejected/);
+  assert.equal((await testEvents())[1]!.event_type, 'TEST_LOG_REJECTED');
+  await postTest(session, fields); assert.equal(sends.length, 1);
+});
+test('lost Discord response is unconfirmed and is never automatically retried', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  sendFailure = 'network';
+  const html = await resultText(await postTest(session, fields), session);
+  assert.match(html, /Delivery was not confirmed/); assert.ok(!html.includes('private network diagnostic'));
+  assert.equal((await testEvents())[1]!.event_type, 'TEST_LOG_UNCONFIRMED');
+  await postTest(session, fields); assert.equal(sends.length, 1);
+});
+test('invalid Discord delivery response is not reported as sent', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  sendFailure = 'invalid';
+  assert.match(await resultText(await postTest(session, fields), session), /Delivery was not confirmed/);
+});
+test('failed request audit prevents the external send', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  failTestAudit = 'request';
+  assert.equal((await postTest(session, fields)).status, 503);
+  assert.equal(sends.length, 0); assert.equal((await testEvents()).length, 0);
+});
+test('failed result audit preserves the claimed request and does not resend', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  failTestAudit = 'result';
+  assert.match(await resultText(await postTest(session, fields), session), /final delivery result is unavailable/);
+  assert.equal(sends.length, 1); assert.equal((await testEvents()).length, 1);
+  failTestAudit = undefined;
+  await postTest(session, fields); assert.equal(sends.length, 1);
+});
+test('an interrupted claimed request remains pending after restart without resending', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  await pool.query(`INSERT INTO audit_events (guild_id, actor_id, event_type, details)
+    VALUES ($1,$2,'TEST_LOG_REQUESTED',$3::jsonb)`, [guild, user,
+      JSON.stringify({ request_id: fields.request_id, channel_id: channelId })]);
+  handler = makeHandler();
+  assert.match(await resultText(await postTest(session, fields), session), /final delivery result is unavailable/);
+  assert.equal(sends.length, 0);
+});
+test('result pages read server-scoped audit records rather than trusting URL success claims', async () => {
+  const session = await signIn(); await configureLog(session);
+  const id = randomToken(); const otherGuild = '100000000000000002';
+  await pool.query('INSERT INTO guild_settings (guild_id) VALUES ($1)', [otherGuild]);
+  await pool.query(`INSERT INTO audit_events (guild_id, actor_id, event_type, details)
+    VALUES ($1,$2,'TEST_LOG_SENT',$3::jsonb)`, [otherGuild, user, JSON.stringify({ request_id: id, channel_id: 'private-channel' })]);
+  const html = await (await request(`/settings?test=${id}`, { headers: { cookie: session } })).text();
+  assert.ok(!html.includes('private-channel')); assert.ok(!html.includes('Discord confirmed delivery'));
+  assert.equal(sends.length, 0);
+});
+
+test('reconnecting bot does not claim or dispatch a test message', async () => {
+  const session = await signIn(); await configureLog(session); const fields = await testForm(session);
+  botReady = false;
+  assert.equal((await postTest(session, fields)).status, 503);
+  assert.equal(sends.length, 0); assert.equal((await testEvents()).length, 0);
+});
+test('revoking a full-access grant during test authorization prevents delivery', async () => {
+  const session = await signIn(); await configureLog(session);
+  roles = [modRole];
+  await pool.query('INSERT INTO staff_access_grants (guild_id, user_id, granted_by) VALUES ($1,$2,$3)', [guild, user, user]);
+  const fields = await testForm(session); let reads = 0;
+  memberReadHook = async () => {
+    if (++reads === 2) await pool.query('DELETE FROM staff_access_grants WHERE guild_id = $1', [guild]);
+  };
+  assert.equal((await postTest(session, fields)).status, 403);
+  assert.equal(sends.length, 0); assert.equal((await testEvents()).length, 0);
 });
