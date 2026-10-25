@@ -63,16 +63,28 @@ async function main(): Promise<void> {
   process.once('SIGTERM', () => { void shutdown(0); });
   process.once('SIGINT', () => { void shutdown(0); });
 
+  let startupStage = 'PostgreSQL connection';
+
   try {
     await pool.query('SELECT 1');
     console.log('PostgreSQL connection verified.');
+
+    startupStage = 'HTTP health server';
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
       server.listen(listenPort, '0.0.0.0', resolve);
     });
+
+    startupStage = 'Discord login';
     await client.login(token);
-  } catch {
-    console.error('Startup failed. Check required settings, PostgreSQL availability, Discord token, and port availability.');
+  } catch (error: unknown) {
+    const rawCode = error && typeof error === 'object' && 'code' in error
+      ? String(error.code) : 'NO_CODE';
+
+    const safeCode = /^[A-Za-z0-9_]+$/.test(rawCode)
+      ? rawCode : 'UNRECOGNIZED_CODE';
+
+    console.error(`Startup failed at ${startupStage}; code=${safeCode}`);
     await shutdown(1);
   }
 }
