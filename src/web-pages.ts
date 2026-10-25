@@ -1,3 +1,4 @@
+import type { LogChannel } from './server-settings.js';
 import { escapeHtml } from './web-security.js';
 
 const css = `
@@ -17,7 +18,7 @@ th{padding:16px 20px;color:#aab4ad;font-weight:500;font-size:11px;letter-spacing
 td{padding:18px 20px;border-top:1px solid #303837;vertical-align:top;overflow-wrap:anywhere;max-width:300px}.mono{font-family:Consolas,monospace;font-size:12px}
 button,.button{display:inline-block;background:#e6ad73;color:#191b1b;border:0;border-radius:9px;padding:12px 18px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none}
 button.secondary{background:transparent;color:#c7d0cb;border:1px solid #414c47;padding:9px 15px}form{margin:0}
-.notice{padding:18px 20px;border:1px solid #424a3c;border-radius:12px;color:#c0cbb5;background:#1d231e;margin:24px 0;font-size:13px;line-height:1.6}
+label{display:block;margin:20px 0 8px}select,textarea{width:100%;max-width:650px;background:#101315;color:#eef0eb;border:1px solid #53615a;border-radius:8px;padding:12px;font:inherit}textarea{display:block;min-height:90px;margin-bottom:20px}nav{display:flex;gap:20px;margin-top:24px}\n.notice{padding:18px 20px;border:1px solid #424a3c;border-radius:12px;color:#c0cbb5;background:#1d231e;margin:24px 0;font-size:13px;line-height:1.6}
 footer{font-size:12px;color:#8b9890;padding-top:30px}.empty{padding:32px;color:#9fada5}.login{max-width:720px}.login .card{margin-top:12px;padding:30px}.tag{color:#e6bd91}
 @media(max-width:700px){.shell{padding:24px 18px}.grid{grid-template-columns:1fr}.hero{padding-top:38px}td,th{padding:13px}.pill{font-size:10px}header{gap:10px}}
 `;
@@ -48,8 +49,25 @@ export function dashboardPage(data: {
 }): string {
   const rows = data.events.map((event) => {
     const reason = typeof event.details.reason === 'string' ? event.details.reason : '—';
+    const settingChange = event.event_type === 'SERVER_SETTINGS_CHANGED' && event.details.setting === 'moderation_log_channel_id'
+      ? `<div class="small mono">Moderation log channel: ${escapeHtml(event.details.previous_channel_id ?? 'Not configured')} → ${escapeHtml(event.details.channel_id ?? 'Not configured')}</div>` : '';
     const target = event.details.target_user_id ?? event.details.role_id ?? '—';
-    return `<tr><td><span class="tag">${escapeHtml(event.event_type.replaceAll('_', ' ').toLowerCase())}</span><div class="small">${escapeHtml(reason)}</div></td><td class="mono">${escapeHtml(event.actor_id)}</td><td class="mono">${escapeHtml(target)}</td><td>${escapeHtml(new Date(event.created_at).toISOString().replace('T', ' ').slice(0, 19))}</td></tr>`;
+    return `<tr><td><span class="tag">${escapeHtml(event.event_type.replaceAll('_', ' ').toLowerCase())}</span><div class="small">${escapeHtml(reason)}</div>${settingChange}</td><td class="mono">${escapeHtml(event.actor_id)}</td><td class="mono">${escapeHtml(target)}</td><td>${escapeHtml(new Date(event.created_at).toISOString().replace('T', ' ').slice(0, 19))}</td></tr>`;
   }).join('');
-  return layout('Overview', `<div class="hero"><div class="eyebrow">Workspace overview</div><h1>Welcome back, ${escapeHtml(data.name)}.</h1><p>Your access and the latest staff activity, together in one place.</p></div><div class="grid"><section class="card"><div class="label">Your Maru access</div><div class="value">${data.access === 'admin' ? 'Admin' : 'Moderator'}</div><div class="small">Verified against current Discord roles</div></section><section class="card"><div class="label">Bot connection</div><div class="value">${data.botReady ? 'Connected' : 'Reconnecting'}</div><div class="small">Database connection verified</div></section><section class="card"><div class="label">Server</div><div class="value">Maru Development</div><div class="small mono">${escapeHtml(data.guildId)}</div></section></div><div class="section-title"><h2>Recent staff activity</h2><span class="muted">Latest 20 events · UTC</span></div><div class="table-wrap"><table><thead><tr><th>Event and reason</th><th>Actor</th><th>Target</th><th>Time UTC</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="empty">No staff activity recorded yet.</td></tr>'}</tbody></table></div><div class="notice">Use <strong>/staff-access</strong> in Discord to manage individual grants. Website configuration controls are coming in a later increment.</div>`, data.nonce, data.csrf);
+  return layout('Overview', `<div class="hero"><div class="eyebrow">Workspace overview</div><h1>Welcome back, ${escapeHtml(data.name)}.</h1><p>Your access and the latest staff activity, together in one place.</p></div><div class="grid"><section class="card"><div class="label">Your Maru access</div><div class="value">${data.access === 'admin' ? 'Admin' : 'Moderator'}</div><div class="small">Verified against current Discord roles</div></section><section class="card"><div class="label">Bot connection</div><div class="value">${data.botReady ? 'Connected' : 'Reconnecting'}</div><div class="small">Database connection verified</div></section><section class="card"><div class="label">Server</div><div class="value">Maru Development</div><div class="small mono">${escapeHtml(data.guildId)}</div></section></div><div class="section-title"><h2>Recent staff activity</h2><span class="muted">Latest 20 events · UTC</span></div><div class="table-wrap"><table><thead><tr><th>Event and reason</th><th>Actor</th><th>Target</th><th>Time UTC</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="empty">No staff activity recorded yet.</td></tr>'}</tbody></table></div><div class="notice"><a href="/settings">Server settings</a> · Use <strong>/staff-access</strong> in Discord to manage individual grants.</div>`, data.nonce, data.csrf);
+}
+
+export function settingsPage(data: {
+  access: 'admin' | 'moderator'; channelId: string | null; channels: LogChannel[];
+  csrf: string; logoutCsrf: string; nonce: string; error?: string; notice?: string;
+}): string {
+  const current = data.channels.find((channel) => channel.id === data.channelId);
+  const currentLabel = current ? `#${current.name}` : data.channelId ? `Unavailable channel (${data.channelId})` : 'Not configured';
+  const choices = data.channels.map((channel) => `<option value="${escapeHtml(channel.id)}"${channel.id === data.channelId ? ' selected' : ''}${!channel.usable ? ' disabled' : ''}>#${escapeHtml(channel.name)}${channel.usable ? '' : ' (missing bot permissions)'}</option>`).join('');
+  const missing = data.channelId && !current ? `<option value="${escapeHtml(data.channelId)}" selected disabled>${escapeHtml(currentLabel)}</option>` : '';
+  return layout('Server settings', `<nav><a href="/dashboard">Overview</a><a href="/settings">Server settings</a></nav><div class="hero"><div class="eyebrow">Server configuration</div><h1>Server settings</h1><p>Choose where Maru will send moderation logs.</p></div>
+    ${data.notice ? `<div class="notice" role="status">${escapeHtml(data.notice)}</div>` : ''}
+    ${data.error ? `<div class="notice" role="alert">${escapeHtml(data.error)} <a href="/settings">Reload settings</a></div>` : `<section class="card"><h2>Moderation log channel</h2><p>Current destination: <strong>${escapeHtml(currentLabel)}</strong></p>
+    <p class="small">This saves the destination for upcoming moderation features. Log delivery is not active yet. Settings changes are recorded under Recent staff activity.</p>
+    ${data.access === 'admin' ? `<form method="post" action="/settings"><input type="hidden" name="csrf" value="${escapeHtml(data.csrf)}"><input type="hidden" name="previous_channel_id" value="${escapeHtml(data.channelId ?? '')}"><label for="channel_id">Destination channel</label><select id="channel_id" name="channel_id"><option value=""${data.channelId === null ? ' selected' : ''}>Not configured</option>${missing}${choices}</select><p class="small">Maru needs View Channel, Send Messages, and Embed Links. Only text and announcement channels are supported.</p><label for="reason">Reason for change</label><textarea id="reason" name="reason" required maxlength="500" placeholder="Why are you changing the log destination?"></textarea><button type="submit">Save settings</button></form>` : '<p>Only Admins and Mods granted full access can change these settings.</p>'}</section>`}`, data.nonce, data.logoutCsrf);
 }

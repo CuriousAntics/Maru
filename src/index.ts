@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { Client, Events, GatewayIntentBits, MessageFlags } from 'discord.js';
+import { Client, Events, GatewayIntentBits, MessageFlags, ChannelType, PermissionFlagsBits } from 'discord.js';
 import pg from 'pg';
 import { port, required, snowflake } from './config.js';
 import { getStaffAccess } from './staff-access.js';
@@ -29,6 +29,19 @@ async function main(): Promise<void> {
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
     isBotReady: () => !stopping && client.isReady(),
+    readLogChannels: async () => {
+      const guild = await client.guilds.fetch(guildId);
+      await guild.roles.fetch();
+      const me = await guild.members.fetchMe({ force: true });
+      const channels = await guild.channels.fetch();
+      return [...channels.values()].flatMap((channel) => {
+        if (!channel || ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)) return [];
+        const permissions = channel.permissionsFor(me);
+        return [{ id: channel.id, name: channel.name, usable: permissions.has([
+          PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks,
+        ]) }];
+      }).sort((a, b) => a.name.localeCompare(b.name));
+    },
     readMemberRoles: async (userId) => {
       try {
         const member = await client.rest.get(Routes.guildMember(guildId, userId)) as RESTGetAPIGuildMemberResult;

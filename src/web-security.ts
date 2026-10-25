@@ -36,6 +36,9 @@ export function equal(a: string, b: string): boolean {
 export function logoutProof(token: string): string {
   return createHmac('sha256', token).update('maru-dashboard-logout').digest('base64url');
 }
+export function settingsProof(token: string): string {
+  return createHmac('sha256', token).update('maru-dashboard-settings').digest('base64url');
+}
 export function cookieName(kind: 'login' | 'session', secure: boolean): string {
   return `${secure ? '__Host-' : ''}maru_${kind}`;
 }
