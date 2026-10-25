@@ -86,6 +86,13 @@ async function main(): Promise<void> {
 
     console.error(`Startup failed at ${startupStage}; code=${safeCode}`);
     await shutdown(1);
+
+        const operation = error && typeof error === 'object' && 'syscall' in error
+      ? String(error.syscall) : 'unknown';
+
+    console.error(
+      `Failed operation: ${/^[A-Za-z0-9_]+$/.test(operation) ? operation : 'unknown'}`
+    );
   }
 }
 
