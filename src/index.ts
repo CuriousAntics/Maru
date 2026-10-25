@@ -4,6 +4,10 @@ import pg from 'pg';
 import { port, required, snowflake } from './config.js';
 import { getStaffAccess } from './staff-access.js';
 import { handleStaffAccess } from './handle-staff-access.js';
+import { createDashboardHandler } from './dashboard.js';
+import { dashboardConfig } from './web-security.js';
+import { Routes } from 'discord.js';
+import type { RESTGetAPIGuildMemberResult } from 'discord.js';
 
 async function main(): Promise<void> {
   const token = required('DISCORD_TOKEN');
@@ -19,9 +23,25 @@ async function main(): Promise<void> {
   });
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
   let stopping = false;
+  let webConfig;
+  try { webConfig = dashboardConfig(process.env); }
+  catch { console.error('Dashboard configuration is invalid; dashboard sign-in is disabled.'); }
+  const dashboard = createDashboardHandler({
+    pool, guildId, config: webConfig,
+    isBotReady: () => !stopping && client.isReady(),
+    readMemberRoles: async (userId) => {
+      try {
+        const member = await client.rest.get(Routes.guildMember(guildId, userId)) as RESTGetAPIGuildMemberResult;
+        return member.roles;
+      } catch (error: unknown) {
+        if (error && typeof error === 'object' && 'code' in error && error.code === 10007) return null;
+        throw error;
+      }
+    },
+  });
   const server = createServer((request, response) => {
     if (request.url !== '/healthz') {
-      response.writeHead(404).end();
+      void dashboard(request, response);
       return;
     }
     void (async () => {
