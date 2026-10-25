@@ -12,7 +12,7 @@ export function resolveStaffAccess(mappings: readonly Mapping[]): StaffAccess {
 }
 
 export async function getStaffAccess(
-  pool: Pool, guildId: string, userId: string, roleIds: readonly string[]
+  pool: Pick<Pool, 'query'>, guildId: string, userId: string, roleIds: readonly string[]
 ): Promise<StaffAccess> {
   // Role membership comes from the current Discord interaction, never command input.
   // One statement reads mappings and grants from a consistent database snapshot.
