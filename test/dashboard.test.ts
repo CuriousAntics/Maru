@@ -6,23 +6,31 @@ import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import type { Pool } from 'pg';
 import { createDashboardHandler } from '../src/dashboard.js';
-import { cookie, dashboardConfig, digest, logoutProof, randomToken } from '../src/web-security.js';
+import { cookie, dashboardConfig, digest, logoutProof, settingsProof, randomToken } from '../src/web-security.js';
 
 const db = new PGlite();
 const guild = '100000000000000001';
 const user = '300000000000000001';
 const adminRole = '200000000000000001';
 const modRole = '200000000000000002';
-const pool = { async query(sql: string, values?: unknown[]) {
+let failSettingsAudit = false;
+async function query(sql: string, values?: unknown[]) {
+  if (failSettingsAudit && sql.includes("'SERVER_SETTINGS_CHANGED'")) throw new Error('test audit write failure');
   const result = await db.query(sql, values);
   return { rows: result.rows, rowCount: result.rows.length || result.affectedRows || 0 };
-} } as unknown as Pool;
+}
+const pool = { query, async connect() { return { query, release() {} }; } } as unknown as Pool;
 let base = '';
 let roles: string[] | null;
 let memberFailure = false;
+let memberReadHook: (() => Promise<void>) | undefined;
 let exchangeFailure = false;
 let exchanges = 0;
 let displayName = 'Miranda';
+const channelId = '500000000000000001';
+const secondChannel = '500000000000000002';
+let channels = [{ id: channelId, name: 'logs', usable: true }, { id: secondChannel, name: 'staff-logs', usable: true }];
+let channelFailure = false;
 const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
   if (String(url).endsWith('/oauth2/token/revoke')) return new Response('{}');
   if (String(url).endsWith('/oauth2/token')) {
@@ -42,7 +50,8 @@ function makeHandler(configured = true) {
     pool, guildId: guild,
     config: configured ? { origin: base, secure: false, applicationId: '400000000000000001', clientSecret: 'test-only' } : undefined,
     isBotReady: () => true,
-    readMemberRoles: async () => { if (memberFailure) throw new Error('Discord unavailable'); return roles; },
+    readMemberRoles: async () => { await memberReadHook?.(); if (memberFailure) throw new Error('Discord unavailable'); return roles; },
+    readLogChannels: async () => { if (channelFailure) throw new Error('channel lookup failed'); return channels; },
     fetcher,
   });
 }
@@ -58,6 +67,8 @@ before(async () => {
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
+  failSettingsAudit = false; channelFailure = false; memberReadHook = undefined;
+  channels = [{ id: channelId, name: 'logs', usable: true }, { id: secondChannel, name: 'staff-logs', usable: true }];
   roles = [adminRole]; memberFailure = false; exchangeFailure = false; exchanges = 0; displayName = 'Miranda';
   await db.exec('TRUNCATE dashboard_login_attempts, dashboard_sessions, audit_events, staff_access_grants, staff_roles, guild_settings RESTART IDENTITY');
   await pool.query('INSERT INTO guild_settings (guild_id) VALUES ($1)', [guild]);
@@ -280,4 +291,172 @@ test('production cookies and base URL validation enforce HTTPS', () => {
   assert.throws(() => dashboardConfig({ ...env, APP_BASE_URL: 'https://public.example/extra' }));
   assert.equal(dashboardConfig({ ...env, APP_BASE_URL: 'https://public.example' })?.secure, true);
   assert.equal(dashboardConfig({}), undefined);
+});
+
+async function saveSettings(session: string, fields: Record<string, string> = {}, headers: Record<string, string> = {}) {
+  return request('/settings', { method: 'POST', headers: {
+    cookie: session, origin: base, 'Content-Type': 'application/x-www-form-urlencoded', ...headers,
+  }, body: new URLSearchParams({ csrf: settingsProof(session.split('=')[1]!), channel_id: channelId,
+    previous_channel_id: '', reason: 'Use the staff log channel', ...fields }) });
+}
+async function savedSettings() {
+  const result = await db.query<{ settings: Record<string, unknown> }>('SELECT settings FROM guild_settings WHERE guild_id = $1', [guild]);
+  return result.rows[0]!.settings;
+}
+async function settingsAudits() {
+  const result = await db.query<{ actor_id: string; details: Record<string, unknown> }>(
+    "SELECT actor_id, details FROM audit_events WHERE event_type = 'SERVER_SETTINGS_CHANGED' ORDER BY event_id");
+  return result.rows;
+}
+
+test('settings page requires authentication', async () => {
+  assert.equal((await request('/settings')).status, 303);
+  assert.equal((await request('/settings', { method: 'POST' })).status, 303);
+});
+test('Admin can choose channels and needs a reason', async () => {
+  const response = await request('/settings', { headers: { cookie: await signIn() } });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /#logs/); assert.match(body, /Save settings/); assert.match(body, /name="reason" required/);
+  assert.match(body, /Log delivery is not active yet/);
+});
+test('ordinary Mod sees settings but cannot submit changes', async () => {
+  roles = [modRole];
+  const session = await signIn();
+  const body = await (await request('/settings', { headers: { cookie: session } })).text();
+  assert.ok(!body.includes('Save settings'));
+  assert.equal((await saveSettings(session)).status, 403);
+  assert.deepEqual(await savedSettings(), {}); assert.equal((await settingsAudits()).length, 0);
+});
+test('Admin saves settings and audit together while preserving other settings and servers', async () => {
+  const otherGuild = '100000000000000002';
+  await pool.query('INSERT INTO guild_settings (guild_id, settings) VALUES ($1, $2::jsonb)', [otherGuild, '{"keep":"other"}']);
+  await pool.query('UPDATE guild_settings SET settings = $2::jsonb WHERE guild_id = $1', [guild, '{"keep":"local"}']);
+  const response = await saveSettings(await signIn());
+  assert.equal(response.status, 303); assert.equal(response.headers.get('location'), '/settings?result=changed');
+  assert.deepEqual(await savedSettings(), { keep: 'local', moderation_log_channel_id: channelId });
+  const audit = await settingsAudits();
+  assert.equal(audit.length, 1); assert.equal(audit[0]!.actor_id, user);
+  assert.deepEqual(audit[0]!.details, { setting: 'moderation_log_channel_id', previous_channel_id: null,
+    channel_id: channelId, reason: 'Use the staff log channel' });
+  const other = await db.query<{ settings: unknown }>('SELECT settings FROM guild_settings WHERE guild_id = $1', [otherGuild]);
+  assert.deepEqual(other.rows[0]!.settings, { keep: 'other' });
+});
+test('full-access Mod can save but revocation blocks the next save', async () => {
+  roles = [modRole];
+  await pool.query('INSERT INTO staff_access_grants (guild_id, user_id, granted_by) VALUES ($1,$2,$3)', [guild, user, user]);
+  const session = await signIn();
+  assert.equal((await saveSettings(session)).status, 303);
+  await pool.query('DELETE FROM staff_access_grants WHERE guild_id = $1', [guild]);
+  assert.equal((await saveSettings(session, { channel_id: secondChannel, previous_channel_id: channelId })).status, 403);
+  assert.equal((await savedSettings()).moderation_log_channel_id, channelId);
+});
+test('lost staff roles block a save from an already open form', async () => {
+  const session = await signIn(); roles = [];
+  assert.equal((await saveSettings(session)).status, 403);
+  assert.deepEqual(await savedSettings(), {});
+});
+test('settings checks same origin and a purpose-specific CSRF proof', async () => {
+  const session = await signIn();
+  assert.equal((await saveSettings(session, {}, { origin: 'https://invalid.example' })).status, 403);
+  assert.equal((await saveSettings(session, {}, { 'Content-Type': 'text/plain' })).status, 403);
+  assert.equal((await saveSettings(session, { csrf: 'wrong' })).status, 403);
+  assert.equal((await saveSettings(session, { csrf: logoutProof(session.split('=')[1]!) })).status, 403);
+  assert.deepEqual(await savedSettings(), {});
+});
+test('expired sessions cannot save settings', async () => {
+  const session = await signIn();
+  await db.exec("UPDATE dashboard_sessions SET expires_at = NOW() - INTERVAL '1 minute'");
+  assert.equal((await saveSettings(session)).status, 303); assert.deepEqual(await savedSettings(), {});
+});
+test('unavailable, foreign, and malformed channels are rejected', async () => {
+  const session = await signIn();
+  channels[0]!.usable = false;
+  assert.equal((await saveSettings(session)).status, 400);
+  channels = [];
+  assert.equal((await saveSettings(session)).status, 400);
+  assert.equal((await saveSettings(session, { channel_id: 'not-an-id' })).status, 400);
+  assert.deepEqual(await savedSettings(), {}); assert.equal((await settingsAudits()).length, 0);
+});
+test('channel lookup failure does not save a setting', async () => {
+  const session = await signIn(); channelFailure = true;
+  assert.equal((await saveSettings(session)).status, 503); assert.deepEqual(await savedSettings(), {});
+});
+test('blank and overlong reasons are rejected without changes', async () => {
+  const session = await signIn();
+  assert.equal((await saveSettings(session, { reason: '   ' })).status, 400);
+  assert.equal((await saveSettings(session, { reason: 'x'.repeat(501) })).status, 400);
+  assert.deepEqual(await savedSettings(), {});
+});
+test('stale form cannot overwrite a later destination', async () => {
+  const session = await signIn();
+  assert.equal((await saveSettings(session)).status, 303);
+  assert.equal((await saveSettings(session, { channel_id: secondChannel })).status, 409);
+  assert.equal((await savedSettings()).moderation_log_channel_id, channelId);
+  assert.equal((await settingsAudits()).length, 1);
+});
+test('no-op save does not duplicate the audit record', async () => {
+  const session = await signIn();
+  await saveSettings(session);
+  const response = await saveSettings(session, { previous_channel_id: channelId });
+  assert.equal(response.status, 303); assert.equal(response.headers.get('location'), '/settings?result=unchanged');
+  assert.equal((await settingsAudits()).length, 1);
+});
+test('clearing a destination records its previous value', async () => {
+  const session = await signIn(); await saveSettings(session);
+  assert.equal((await saveSettings(session, { channel_id: '', previous_channel_id: channelId })).status, 303);
+  assert.equal((await savedSettings()).moderation_log_channel_id, null);
+  assert.equal((await settingsAudits())[1]!.details.previous_channel_id, channelId);
+});
+test('audit failure rolls back the settings update', async () => {
+  const session = await signIn(); failSettingsAudit = true;
+  assert.equal((await saveSettings(session)).status, 503);
+  assert.deepEqual(await savedSettings(), {}); assert.equal((await settingsAudits()).length, 0);
+});
+test('duplicate fields and oversized requests are rejected', async () => {
+  const session = await signIn();
+  const response = await request('/settings', { method: 'POST', headers: {
+    cookie: session, origin: base, 'Content-Type': 'application/x-www-form-urlencoded',
+  }, body: new URLSearchParams([['csrf', settingsProof(session.split('=')[1]!)], ['channel_id', channelId],
+    ['channel_id', secondChannel], ['previous_channel_id', ''], ['reason', 'test']]) });
+  assert.equal(response.status, 400);
+  assert.equal((await saveSettings(session, { reason: 'x'.repeat(5000) })).status, 413);
+  assert.deepEqual(await savedSettings(), {});
+});
+test('settings escape channel names and show missing destinations honestly', async () => {
+  channels[0]!.name = '<script>channel</script>';
+  const session = await signIn(); await saveSettings(session);
+  let body = await (await request('/settings', { headers: { cookie: session } })).text();
+  assert.ok(body.includes('&lt;script&gt;channel&lt;/script&gt;')); assert.ok(!body.includes('<script>channel'));
+  channels = [];
+  body = await (await request('/settings', { headers: { cookie: session } })).text();
+  assert.match(body, /Unavailable channel/);
+});
+test('saved destination survives a handler restart', async () => {
+  const session = await signIn(); await saveSettings(session); handler = makeHandler();
+  const response = await request('/settings', { headers: { cookie: session } });
+  assert.match(await response.text(), /value="500000000000000001" selected/);
+});
+
+test('save rechecks current roles inside the settings transaction', async () => {
+  const session = await signIn();
+  let reads = 0;
+  memberReadHook = async () => { if (++reads === 2) roles = []; };
+  assert.equal((await saveSettings(session)).status, 403);
+  assert.equal(reads, 2); assert.deepEqual(await savedSettings(), {});
+});
+test('save rechecks a full-access grant after the initial request check', async () => {
+  roles = [modRole];
+  await pool.query('INSERT INTO staff_access_grants (guild_id, user_id, granted_by) VALUES ($1,$2,$3)', [guild, user, user]);
+  const session = await signIn(); let reads = 0;
+  memberReadHook = async () => {
+    if (++reads === 2) await pool.query('DELETE FROM staff_access_grants WHERE guild_id = $1', [guild]);
+  };
+  assert.equal((await saveSettings(session)).status, 403);
+  assert.deepEqual(await savedSettings(), {});
+});
+test('overview displays the previous and new log destinations', async () => {
+  const session = await signIn(); await saveSettings(session);
+  const body = await (await request('/dashboard', { headers: { cookie: session } })).text();
+  assert.ok(body.includes(`Moderation log channel: Not configured → ${channelId}`));
 });

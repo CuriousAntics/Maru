@@ -2,19 +2,22 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Pool } from 'pg';
 import { getStaffAccess } from './staff-access.js';
 import {
-  cookie, cookieName, digest, equal, logoutProof, randomToken, readCookie, validToken,
+  cookie, cookieName, digest, equal, logoutProof, randomToken, readCookie, settingsProof, validToken,
 } from './web-security.js';
 import type { DashboardConfig } from './web-security.js';
-import { dashboardPage, loginPage, messagePage } from './web-pages.js';
+import { dashboardPage, loginPage, messagePage, settingsPage } from './web-pages.js';
+import { logChannelId, saveLogChannel, SettingsError } from './server-settings.js';
+import type { LogChannel } from './server-settings.js';
 import type { AuditRow } from './web-pages.js';
 
 type Session = { user_id: string; display_name: string };
 type Options = {
-  pool: Pick<Pool, 'query'>;
+  pool: Pick<Pool, 'query' | 'connect'>;
   guildId: string;
   config?: DashboardConfig;
   isBotReady: () => boolean;
   readMemberRoles: (userId: string) => Promise<string[] | null>;
+  readLogChannels?: () => Promise<LogChannel[]>;
   fetcher?: typeof fetch;
 };
 
@@ -60,7 +63,7 @@ export function createDashboardHandler(options: Options) {
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
-    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout'];
+    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings'];
     if (!routes.includes(path)) {
       message(response, 404, 'Page not found', 'This page is not available.');
       return;
@@ -69,8 +72,8 @@ export function createDashboardHandler(options: Options) {
       message(response, 503, 'Dashboard setup pending', 'Dashboard sign-in has not been configured yet.');
       return;
     }
-    const expectedMethod = path === '/auth/logout' ? 'POST' : 'GET';
-    if (request.method !== expectedMethod) {
+    const expectedMethod = path === '/auth/logout' ? 'POST' : path === '/settings' ? 'GET, POST' : 'GET';
+    if (!expectedMethod.split(', ').includes(request.method ?? '')) {
       response.setHeader('Allow', expectedMethod);
       message(response, 405, 'Method not allowed', 'Use the dashboard controls to continue.');
       return;
@@ -244,6 +247,72 @@ export function createDashboardHandler(options: Options) {
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
       return;
     }
+    if (path === '/settings') {
+      if (!options.readLogChannels) throw new Error('CHANNEL_LOOKUP_UNAVAILABLE');
+      if (request.method === 'POST') {
+        if (access !== 'admin') {
+          message(response, 403, 'Admin access required', 'Only Admins and Mods granted full access can change server settings.');
+          return;
+        }
+        if (request.headers.origin !== config.origin ||
+            request.headers['content-type']?.split(';')[0]?.trim() !== 'application/x-www-form-urlencoded') {
+          message(response, 403, 'Request rejected', 'Use the server settings form to save changes.');
+          return;
+        }
+        let body = '';
+        for await (const chunk of request) {
+          body += String(chunk);
+          if (Buffer.byteLength(body) > 4096) {
+            message(response, 413, 'Request too large', 'Please use the server settings form.');
+            return;
+          }
+        }
+        const params = new URLSearchParams(body);
+        const keys = ['csrf', 'channel_id', 'previous_channel_id', 'reason'];
+        if (keys.some((key) => params.getAll(key).length !== 1) ||
+            [...params.keys()].some((key) => !keys.includes(key))) {
+          message(response, 400, 'Invalid settings', 'Reload the settings page and try again.'); return;
+        }
+        if (!equal(params.get('csrf')!, settingsProof(sessionToken))) {
+          message(response, 403, 'Request rejected', 'Reload the settings page and try again.'); return;
+        }
+        try {
+          const changed = await saveLogChannel(pool, {
+            guildId, actorId: session.user_id, sessionToken,
+            channelId: params.get('channel_id') || null,
+            previousChannelId: params.get('previous_channel_id') || null,
+            reason: params.get('reason')!, readMemberRoles, readLogChannels: options.readLogChannels,
+          });
+          redirect(response, `/settings?result=${changed}`);
+        } catch (error) {
+          if (!(error instanceof SettingsError)) throw error;
+          const errors: Record<string, [number, string]> = {
+            ADMIN_REQUIRED: [403, 'Your current access does not allow settings changes.'],
+            SESSION_EXPIRED: [403, 'Your session expired. Sign in again.'],
+            SETTINGS_CHANGED: [409, 'Another staff member changed this setting. Reload the settings page before trying again.'],
+            CHANNEL_UNAVAILABLE: [400, 'Choose an available text or announcement channel where Maru can view the channel, send messages, and embed links.'],
+            INVALID_CHANNEL: [400, 'Choose a channel from the settings form.'],
+            INVALID_REASON: [400, 'Enter a reason between 1 and 500 characters.'],
+            SERVER_NOT_CONFIGURED: [409, 'This server has not been configured.'],
+          };
+          const [status, text] = errors[error.code] ?? [400, 'Reload the settings page and try again.'];
+          html(response, status, (nonce) => settingsPage({ access, channelId: null, channels: [],
+            csrf: settingsProof(sessionToken), logoutCsrf: logoutProof(sessionToken), nonce, error: text }));
+        }
+        return;
+      }
+      const settings = await pool.query<{ settings: Record<string, unknown> }>(
+        'SELECT settings FROM guild_settings WHERE guild_id = $1', [guildId]);
+      if (!settings.rows[0]) throw new Error('SERVER_NOT_CONFIGURED');
+      const channels = await options.readLogChannels();
+      const result = new URL(request.url ?? '/', config.origin).searchParams.get('result');
+      html(response, 200, (nonce) => settingsPage({ access,
+        channelId: logChannelId(settings.rows[0]!.settings), channels,
+        csrf: settingsProof(sessionToken), logoutCsrf: logoutProof(sessionToken), nonce,
+        notice: result === 'changed' ? 'Setting saved and recorded in the audit log.' :
+          result === 'unchanged' ? 'No change was needed.' : undefined }));
+      return;
+    }
     const events = await pool.query<AuditRow>(
       `SELECT event_id, event_type, actor_id, details, created_at FROM audit_events
        WHERE guild_id = $1 ORDER BY event_id DESC LIMIT 20`, [guildId]);
@@ -256,7 +325,7 @@ export function createDashboardHandler(options: Options) {
     catch {
       // Do not log callback URLs, cookies, tokens, or raw provider errors.
       console.error('Dashboard request failed. No sensitive request details were logged.');
-      if (!response.headersSent) message(response, 503, 'Temporarily unavailable', 'Maru could not complete this request. Please try again shortly.');
+      if (!response.headersSent) message(response, 503, 'Temporarily unavailable', 'Maru could not complete this request. If you were saving settings, reload the settings page and check the current value before retrying.');
       else response.end();
     }
   };
