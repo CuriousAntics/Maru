@@ -317,6 +317,7 @@ test('Admin can choose channels and needs a reason', async () => {
   const response = await request('/settings', { headers: { cookie: await signIn() } });
   assert.equal(response.status, 200);
   const body = await response.text();
+  assert.equal(response.headers.get('referrer-policy'), 'same-origin');
   assert.match(body, /#logs/); assert.match(body, /Save settings/); assert.match(body, /name="reason" required/);
   assert.match(body, /Log delivery is not active yet/);
 });
@@ -359,6 +360,7 @@ test('lost staff roles block a save from an already open form', async () => {
 test('settings checks same origin and a purpose-specific CSRF proof', async () => {
   const session = await signIn();
   assert.equal((await saveSettings(session, {}, { origin: 'https://invalid.example' })).status, 403);
+  assert.equal((await saveSettings(session, {}, { origin: 'null' })).status, 403);
   assert.equal((await saveSettings(session, {}, { 'Content-Type': 'text/plain' })).status, 403);
   assert.equal((await saveSettings(session, { csrf: 'wrong' })).status, 403);
   assert.equal((await saveSettings(session, { csrf: logoutProof(session.split('=')[1]!) })).status, 403);

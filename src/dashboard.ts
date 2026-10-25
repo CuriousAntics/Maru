@@ -23,7 +23,8 @@ type Options = {
 
 function headers(response: ServerResponse, nonce: string): void {
   response.setHeader('Cache-Control', 'no-store');
-  response.setHeader('Referrer-Policy', 'no-referrer');
+  // Preserve Origin on same-origin form POSTs; suppress cross-origin referrers.
+  response.setHeader('Referrer-Policy', 'same-origin');
   response.setHeader('X-Content-Type-Options', 'nosniff');
   response.setHeader('X-Frame-Options', 'DENY');
   response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
