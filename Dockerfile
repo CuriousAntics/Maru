@@ -12,5 +12,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
+COPY migrations ./migrations
 USER node
 CMD ["node", "dist/index.js"]

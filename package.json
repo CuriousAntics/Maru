@@ -11,7 +11,9 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "start": "node --env-file-if-exists=.env dist/index.js",
-    "commands:test": "node --env-file-if-exists=.env --import tsx src/register-commands.ts"
+    "commands:test": "node --env-file-if-exists=.env --import tsx src/register-commands.ts",
+    "db:migrate": "node --env-file-if-exists=.env --import tsx src/migrate.ts",
+    "db:migrate:deploy": "node dist/migrate.js"
   },
   "dependencies": {
     "discord.js": "14.27.0",
