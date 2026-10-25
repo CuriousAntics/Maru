@@ -3,6 +3,7 @@ import { Client, Events, GatewayIntentBits, MessageFlags } from 'discord.js';
 import pg from 'pg';
 import { port, required, snowflake } from './config.js';
 import { getStaffAccess } from './staff-access.js';
+import { handleStaffAccess } from './handle-staff-access.js';
 
 async function main(): Promise<void> {
   const token = required('DISCORD_TOKEN');
@@ -52,7 +53,7 @@ async function main(): Promise<void> {
   client.once(Events.ClientReady, () => console.log('Maru is connected to Discord.'));
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-    if (!['ping', 'staff-check'].includes(interaction.commandName)) return;
+    if (!['ping', 'staff-check', 'staff-access'].includes(interaction.commandName)) return;
     try {
       if (interaction.guildId !== guildId || !interaction.member) {
         await interaction.reply({
@@ -68,6 +69,10 @@ async function main(): Promise<void> {
 
       // Acknowledge before the database query so a slow query cannot time out the interaction.
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (interaction.commandName === 'staff-access') {
+        await handleStaffAccess(interaction, pool, guildId);
+        return;
+      }
       const roleIds = Array.isArray(interaction.member.roles)
         ? interaction.member.roles
         : [...interaction.member.roles.cache.keys()];
@@ -76,9 +81,9 @@ async function main(): Promise<void> {
         ? 'Access denied: you do not have a configured Maru staff role.'
         : `Your Maru access level: ${access === 'admin' ? 'Admin' : 'Moderator'}.`);
     } catch {
-      console.error('Command failed. Access was not granted.');
+      console.error('Command failed; a requested access change may already have been saved.');
       try {
-        const content = 'Maru could not verify your access. Please try again later.';
+        const content = 'Maru could not finish this request. A requested access change may already have been saved.';
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply(content);
         } else {
