@@ -4,6 +4,8 @@ import pg from 'pg';
 import { port, required, snowflake } from './config.js';
 import { getStaffAccess } from './staff-access.js';
 import { handleStaffAccess } from './handle-staff-access.js';
+import { handleWarning } from './handle-warning.js';
+import { warningDependencies } from './warning-discord.js';
 import { createDashboardHandler } from './dashboard.js';
 import { dashboardConfig } from './web-security.js';
 import { Routes } from 'discord.js';
@@ -26,6 +28,20 @@ async function main(): Promise<void> {
   let webConfig;
   try { webConfig = dashboardConfig(process.env); }
   catch { console.error('Dashboard configuration is invalid; dashboard sign-in is disabled.'); }
+  const readLogChannels = async () => {
+    const guild = await client.guilds.fetch(guildId);
+    await guild.roles.fetch();
+    const me = await guild.members.fetchMe({ force: true });
+    const channels = await guild.channels.fetch();
+    return [...channels.values()].flatMap((channel) => {
+      if (!channel || ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)) return [];
+      const permissions = channel.permissionsFor(me);
+      return [{ id: channel.id, name: channel.name, usable: permissions.has([
+        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks,
+      ]) }];
+    }).sort((a, b) => a.name.localeCompare(b.name));
+  };
+  const warningDeps = warningDependencies(client, guildId, readLogChannels);
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
     isBotReady: () => !stopping && client.isReady(),
@@ -35,19 +51,7 @@ async function main(): Promise<void> {
       }) as RESTPostAPIChannelMessageResult;
       return { id: message.id, channel_id: message.channel_id };
     },
-    readLogChannels: async () => {
-      const guild = await client.guilds.fetch(guildId);
-      await guild.roles.fetch();
-      const me = await guild.members.fetchMe({ force: true });
-      const channels = await guild.channels.fetch();
-      return [...channels.values()].flatMap((channel) => {
-        if (!channel || ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)) return [];
-        const permissions = channel.permissionsFor(me);
-        return [{ id: channel.id, name: channel.name, usable: permissions.has([
-          PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks,
-        ]) }];
-      }).sort((a, b) => a.name.localeCompare(b.name));
-    },
+    readLogChannels,
     readMemberRoles: async (userId) => {
       try {
         const member = await client.rest.get(Routes.guildMember(guildId, userId)) as RESTGetAPIGuildMemberResult;
@@ -92,7 +96,7 @@ async function main(): Promise<void> {
   client.once(Events.ClientReady, () => console.log('Maru is connected to Discord.'));
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-    if (!['ping', 'staff-check', 'staff-access'].includes(interaction.commandName)) return;
+    if (!['ping', 'staff-check', 'staff-access', 'warn', 'case'].includes(interaction.commandName)) return;
     try {
       if (interaction.guildId !== guildId || !interaction.member) {
         await interaction.reply({
@@ -108,6 +112,10 @@ async function main(): Promise<void> {
 
       // Acknowledge before the database query so a slow query cannot time out the interaction.
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (interaction.commandName === 'warn' || interaction.commandName === 'case') {
+        await handleWarning(interaction, pool, guildId, warningDeps);
+        return;
+      }
       if (interaction.commandName === 'staff-access') {
         await handleStaffAccess(interaction, pool, guildId);
         return;
@@ -120,9 +128,9 @@ async function main(): Promise<void> {
         ? 'Access denied: you do not have a configured Maru staff role.'
         : `Your Maru access level: ${access === 'admin' ? 'Admin' : 'Moderator'}.`);
     } catch {
-      console.error('Command failed; a requested access change may already have been saved.');
+      console.error('Command failed; a requested change may already have been saved.');
       try {
-        const content = 'Maru could not finish this request. A requested access change may already have been saved.';
+        const content = 'Maru could not finish this request. A requested change may already have been saved.';
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply(content);
         } else {

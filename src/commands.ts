@@ -26,3 +26,16 @@ export const staffAccess = new SlashCommandBuilder()
       .setMinLength(17).setMaxLength(20).setRequired(true))
     .addStringOption((option) => option.setName('reason')
       .setDescription('Why the grant is being revoked').setMinLength(1).setMaxLength(500).setRequired(true)));
+
+export const warn = new SlashCommandBuilder()
+  .setName('warn')
+  .setDescription('Record a member warning and attempt a DM and moderation log.')
+  .addUserOption((option) => option.setName('member').setDescription('Member receiving the warning').setRequired(true))
+  .addStringOption((option) => option.setName('reason').setDescription('Why this warning is being issued')
+    .setMinLength(1).setMaxLength(500).setRequired(true));
+
+export const caseLookup = new SlashCommandBuilder()
+  .setName('case')
+  .setDescription('Look up a saved moderation case in this server (staff only).')
+  .addIntegerOption((option) => option.setName('number').setDescription('Server case number')
+    .setMinValue(1).setMaxValue(2147483647).setRequired(true));
