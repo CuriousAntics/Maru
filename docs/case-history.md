@@ -17,11 +17,11 @@ The list displays up to 20 cases, newest first, with case number, reason preview
 
 The page reads the statuses recorded on the case. **Sent** means Discord confirmed message creation, not that a member read the message. **Not confirmed** or **Not confirmed (attempt started)** can follow a lost response, restart, or result-audit failure. No message is automatically resent by viewing or refreshing history.
 
-These pages only display cases. They do not create, edit, void, or delete warnings, retry notifications, DM members, or post log messages. Warning reasons and stored names are HTML-escaped and are not interpreted as HTML. Detail reasons preserve line breaks. Authenticated case responses are not cached.
+The list displays cases. Authorized staff can use the detail page to [correct or void a warning](case-changes.md). Browsing never creates a warning or sends a notification. Warning reasons and stored names are HTML-escaped and are not interpreted as HTML. Detail reasons preserve line breaks. Authenticated case responses are not cached.
 
 ## Verification
 
-No new packages, database migrations, environment variables, or slash-command registrations are required. The previously applied `003_moderation_warnings.sql` tables are used.
+Case history uses the existing warning tables. The correction/voiding increment adds `004_case_changes.sql`; apply that migration before deploying its code. No new packages, environment variables, or slash-command registrations are required.
 
 ```powershell
 npm run check

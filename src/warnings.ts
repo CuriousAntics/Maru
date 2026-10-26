@@ -15,6 +15,8 @@ export type WarningCase = {
   actor_id: string; target_user_id: string; reason: string; guild_name: string;
   log_channel_id: string | null; dm_status: DeliveryStatus; log_status: DeliveryStatus;
   dm_message_id: string | null; log_message_id: string | null; created_at: Date;
+  original_reason: string; state: 'active' | 'void'; revision: number; updated_at: Date;
+  last_changed_by: string | null; void_reason: string | null;
 };
 export type WarningContext = {
   actorRoleIds: string[]; targetRoleIds: string[];
@@ -54,7 +56,7 @@ export async function createWarning(pool: Database, input: {
     const prior = await client.query<WarningCase>(
       'SELECT * FROM moderation_cases WHERE guild_id = $1 AND request_id = $2', [input.guildId, input.requestId]);
     if (prior.rows[0]) {
-      if (prior.rows[0].actor_id !== input.actorId || prior.rows[0].target_user_id !== input.targetId || prior.rows[0].reason !== reason) {
+      if (prior.rows[0].actor_id !== input.actorId || prior.rows[0].target_user_id !== input.targetId || prior.rows[0].original_reason !== reason) {
         throw new WarningError('REQUEST_MISMATCH');
       }
       await client.query('COMMIT'); transaction = false;
@@ -77,8 +79,8 @@ export async function createWarning(pool: Database, input: {
     const channelId = logChannelId(guild.rows[0].settings);
     const result = await client.query<WarningCase>(
       `INSERT INTO moderation_cases (guild_id, case_number, request_id, action, actor_id, target_user_id,
-         reason, guild_name, log_channel_id, log_status)
-       VALUES ($1,$2,$3,'warning',$4,$5,$6,$7,$8,$9) RETURNING *`,
+         reason, guild_name, log_channel_id, log_status, original_reason)
+       VALUES ($1,$2,$3,'warning',$4,$5,$6,$7,$8,$9,$6) RETURNING *`,
       [input.guildId, counter.rows[0]!.last_case_number, input.requestId, input.actorId, input.targetId,
         reason, context.guildName.slice(0, 100), channelId, channelId ? 'pending' : 'not_configured']);
     const record = result.rows[0]!;
@@ -127,7 +129,7 @@ export async function deliverWarning(pool: Database, record: WarningCase, deps: 
   const claim = await pool.query<WarningCase>(
     `UPDATE moderation_cases SET dm_status = 'sending',
        log_status = CASE WHEN log_status = 'pending' THEN 'sending' ELSE log_status END
-     WHERE guild_id = $1 AND case_number = $2 AND dm_status = 'pending' RETURNING *`,
+     WHERE guild_id = $1 AND case_number = $2 AND dm_status = 'pending' AND state = 'active' RETURNING *`,
     [record.guild_id, record.case_number]);
   if (!claim.rows[0]) {
     const current = await pool.query<WarningCase>(

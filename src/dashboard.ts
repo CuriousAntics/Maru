@@ -2,11 +2,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Pool } from 'pg';
 import { getStaffAccess } from './staff-access.js';
 import {
-  cookie, cookieName, digest, equal, logoutProof, randomToken, readCookie, settingsProof, testLogProof, validToken,
+  caseChangeProof, cookie, cookieName, digest, equal, logoutProof, randomToken, readCookie, settingsProof, testLogProof, validToken,
 } from './web-security.js';
 import type { DashboardConfig } from './web-security.js';
 import { dashboardPage, loginPage, messagePage, settingsPage, caseHistoryPage, caseDetailPage } from './web-pages.js';
-import { CaseHistoryError, parseCaseFilter, parseCaseNumber, loadCaseHistory, loadCaseDetail } from './case-history.js';
+import { CaseHistoryError, parseCaseFilter, parseCaseNumber, loadCaseHistory, loadCaseDetail, loadCaseChanges } from './case-history.js';
+import { changeCase, CaseChangeError } from './case-changes.js';
 import { sendTestLog } from './test-log.js';
 import type { SendTestMessage } from './test-log.js';
 import { logChannelId, saveLogChannel, SettingsError } from './server-settings.js';
@@ -70,7 +71,8 @@ export function createDashboardHandler(options: Options) {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
     const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases'];
     const caseDetail = /^\/cases\/([^/]+)$/.exec(path);
-    if (!routes.includes(path) && !caseDetail) {
+    const caseMutation = /^\/cases\/([^/]+)\/(correct|void)$/.exec(path);
+    if (!routes.includes(path) && !caseDetail && !caseMutation) {
       message(response, 404, 'Page not found', 'This page is not available.');
       return;
     }
@@ -78,7 +80,7 @@ export function createDashboardHandler(options: Options) {
       message(response, 503, 'Dashboard setup pending', 'Dashboard sign-in has not been configured yet.');
       return;
     }
-    const expectedMethod = ['/auth/logout', '/settings/test-log'].includes(path) ? 'POST' : path === '/settings' ? 'GET, POST' : 'GET';
+    const expectedMethod = (caseMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : path === '/settings' ? 'GET, POST' : 'GET';
     if (!expectedMethod.split(', ').includes(request.method ?? '')) {
       response.setHeader('Allow', expectedMethod);
       message(response, 405, 'Method not allowed', 'Use the dashboard controls to continue.');
@@ -253,6 +255,55 @@ export function createDashboardHandler(options: Options) {
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
       return;
     }
+    if (caseMutation) {
+      try {
+        const number = parseCaseNumber(caseMutation[1]!);
+        const action = caseMutation[2] as 'correct' | 'void';
+        if (request.headers.origin !== config.origin ||
+            request.headers['content-type']?.split(';')[0]?.trim() !== 'application/x-www-form-urlencoded') {
+          message(response, 403, 'Request rejected', 'Reload the case page and use its change form.'); return;
+        }
+        let body = '';
+        for await (const chunk of request) {
+          body += String(chunk);
+          if (Buffer.byteLength(body) > 16384) {
+            message(response, 413, 'Request too large', 'Use the case change form.'); return;
+          }
+        }
+        const params = new URLSearchParams(body);
+        const keys = action === 'correct' ? ['csrf', 'revision', 'reason', 'new_reason'] : ['csrf', 'revision', 'reason', 'confirm'];
+        const revisionText = params.get('revision') ?? '';
+        if (keys.some((key) => params.getAll(key).length !== 1) || [...params.keys()].some((key) => !keys.includes(key)) ||
+            !/^(0|[1-9]\d{0,9})$/.test(revisionText) || Number(revisionText) > 2147483647) {
+          throw new CaseChangeError('INVALID_INPUT');
+        }
+        const revision = Number(revisionText);
+        if (!equal(params.get('csrf')!, caseChangeProof(sessionToken, number, revision, action))) {
+          message(response, 403, 'Request rejected', 'Reload the case page and try again.'); return;
+        }
+        if (action === 'void' && params.get('confirm') !== String(number)) throw new CaseChangeError('CONFIRM_REQUIRED');
+        await changeCase(pool, { guildId, actorId: session.user_id, sessionToken, caseNumber: number,
+          expectedRevision: revision, action, reason: params.get('reason')!,
+          newReason: params.get('new_reason') ?? undefined, readMemberRoles });
+        redirect(response, `/cases/${number}`);
+      } catch (error) {
+        if (!(error instanceof CaseChangeError) && !(error instanceof CaseHistoryError)) throw error;
+        const messages: Record<string, [number, string]> = {
+          ACCESS_DENIED: [403, 'Mods may change only warnings they issued. Admins and Mods with full access may change any warning.'],
+          SESSION_EXPIRED: [403, 'Your session expired. Sign in again before changing this case.'],
+          CASE_NOT_FOUND: [404, 'No case with that number exists in this server.'],
+          STALE_CASE: [409, 'The case changed while this form was open. Reload it before trying again.'],
+          CASE_VOIDED: [409, 'This warning is already voided. Its history is retained.'],
+          INVALID_REASON: [400, 'The corrected reason and change justification must each contain 1 to 500 characters.'],
+          INVALID_INPUT: [400, 'Reload the case and use its change form.'],
+          CONFIRM_REQUIRED: [400, 'Enter the case number in the confirmation field to void this warning.'],
+        };
+        const [status, text] = error instanceof CaseChangeError ? messages[error.code] ?? [400, 'Invalid case change.'] : [400, error.message];
+        html(response, status, (nonce) => caseHistoryPage({ cases: [], hasOlder: false, filter: {},
+          nonce, csrf: logoutProof(sessionToken), error: text }));
+      }
+      return;
+    }
     if (path === '/cases' || caseDetail) {
       try {
         if (caseDetail) {
@@ -263,7 +314,11 @@ export function createDashboardHandler(options: Options) {
               nonce, csrf: logoutProof(sessionToken), error: 'No case with that number exists in this server.' }));
             return;
           }
-          html(response, 200, (nonce) => caseDetailPage({ record, nonce, csrf: logoutProof(sessionToken) }));
+          const changes = await loadCaseChanges(pool, guildId, number);
+          html(response, 200, (nonce) => caseDetailPage({ record, nonce, csrf: logoutProof(sessionToken), changes,
+            canChange: access === 'admin' || record.actor_id === session.user_id,
+            correctCsrf: caseChangeProof(sessionToken, number, record.revision, 'correct'),
+            voidCsrf: caseChangeProof(sessionToken, number, record.revision, 'void') }));
         } else {
           const filter = parseCaseFilter(new URL(request.url ?? '/', config.origin).searchParams);
           const page = await loadCaseHistory(pool, guildId, filter);
@@ -421,7 +476,7 @@ export function createDashboardHandler(options: Options) {
     catch {
       // Do not log callback URLs, cookies, tokens, or raw provider errors.
       console.error('Dashboard request failed. No sensitive request details were logged.');
-      if (!response.headersSent) message(response, 503, 'Temporarily unavailable', 'Maru could not complete this request. If you were saving settings or sending a test log, reload settings and check the current value or log channel before retrying.');
+      if (!response.headersSent) message(response, 503, 'Temporarily unavailable', 'Maru could not complete this request. If you were making a change or sending a test log, reload the affected page and check its saved state and audit history before retrying.');
       else response.end();
     }
   };
