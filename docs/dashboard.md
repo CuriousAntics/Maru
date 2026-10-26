@@ -1,6 +1,6 @@
 # Dashboard sign in
 
-The first dashboard supports Discord sign-in, a live staff access display, the latest 20 audit events for the configured test server, and sign-out. The server settings page now configures the moderation log destination; see [Server settings](server-settings.md). Grant/revoke website forms are not included yet.
+The dashboard supports Discord sign-in, a live staff access display, the latest 20 audit events for the configured test server, and sign-out. Staff can browse [Moderation case history](case-history.md), filter by member ID, and inspect individual saved cases. The server settings page now configures the moderation log destination; see [Server settings](server-settings.md). Grant/revoke website forms are not included yet.
 
 ## Hosting configuration
 
