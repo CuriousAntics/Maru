@@ -1,6 +1,7 @@
 import { escapeMarkdown } from 'discord.js';
 import type { ChatInputCommandInteraction } from 'discord.js';
 import type { Pool } from 'pg';
+import { actionLabel, actionResultLabel } from './case-labels.js';
 import { createWarning, deliverWarning, getWarningCase, WarningError } from './warnings.js';
 import type { DeliveryStatus, WarningCase, WarningDependencies } from './warnings.js';
 
@@ -20,11 +21,12 @@ const errors: Record<string, string> = {
 };
 export function deliveryLabel(status: DeliveryStatus): string {
   return ({ pending: 'Not attempted', sending: 'Not confirmed (attempt started)', sent: 'Sent',
-    failed: 'Failed', unconfirmed: 'Not confirmed', not_configured: 'No log channel configured' })[status];
+    failed: 'Failed', unconfirmed: 'Not confirmed', not_configured: 'No log channel configured', skipped: 'Not sent (action not confirmed)' })[status];
 }
 export function caseSummary(record: WarningCase): string {
-  return `Case #${record.case_number} · Warning · ${record.state === 'void' ? 'Voided' : 'Active'}\nMember ID: ${record.target_user_id}\nStaff ID: ${record.actor_id}\n` +
+  return `Case #${record.case_number} · ${actionLabel(record.action)} · ${record.action !== 'warning' ? 'Recorded' : record.state === 'void' ? 'Voided' : 'Active'}\nMember ID: ${record.target_user_id}\nStaff ID: ${record.actor_id}\n` +
     `Reason: ${escapeMarkdown(record.reason)}\nCreated: ${new Date(record.created_at).toISOString()}\n` +
+    (record.action !== 'warning' ? `Action: ${actionResultLabel(record.action_status)}\nRequested end UTC: ${record.requested_until ? new Date(record.requested_until).toISOString() : 'None (removal)'}\n` : '') +
     `DM: ${deliveryLabel(record.dm_status)}\nModeration log: ${deliveryLabel(record.log_status)}`;
 }
 

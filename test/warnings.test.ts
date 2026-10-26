@@ -84,7 +84,7 @@ async function read(number: number, selectedGuild = guild) {
 }
 
 before(async () => {
-  for (const name of ['001_foundation.sql', '003_moderation_warnings.sql', '004_case_changes.sql']) {
+  for (const name of ['001_foundation.sql', '003_moderation_warnings.sql', '004_case_changes.sql', '005_timeouts.sql']) {
     await db.exec((await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8')).replace(/^\uFEFF/, ''));
   }
 });
@@ -413,5 +413,14 @@ test('case-change migration preserves legacy cases, accepts old inserts, and gua
     assert.deepEqual(rows.map((row) => row.original_reason), ['Original legacy reason', 'Old bot still works']);
     assert.ok(rows.every((row) => row.state === 'active' && row.revision === 0));
     await assert.rejects(legacy.exec("UPDATE moderation_cases SET original_reason='Rewritten'"), /ORIGINAL_REASON_IMMUTABLE/);
+    await legacy.exec("UPDATE moderation_cases SET dm_status='sent',log_status='sent' WHERE case_number=1");
+    await legacy.exec(await readFile(new URL('../migrations/005_timeouts.sql',import.meta.url),'utf8'));
+    await legacy.query(oldInsert,[guild,3,'old-bot-after-timeouts',actor,target,'Legacy warning after timeout migration']);
+    const latest = (await legacy.query<{ original_reason: string; action_status: string }>(
+      'SELECT original_reason,action_status FROM moderation_cases WHERE case_number=3')).rows[0]!;
+    assert.equal(latest.original_reason,'Legacy warning after timeout migration'); assert.equal(latest.action_status,'not_applicable');
+    const delivered = (await legacy.query<{ notification_claimed_at: Date | null }>(
+      'SELECT notification_claimed_at FROM moderation_cases WHERE case_number=1')).rows[0]!;
+    assert.ok(delivered.notification_claimed_at);
   } finally { await legacy.close(); }
 });

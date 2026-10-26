@@ -75,7 +75,7 @@ let handler: ReturnType<typeof makeHandler>;
 const server = createServer((request, response) => { void handler(request, response); });
 
 before(async () => {
-  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql', '003_moderation_warnings.sql', '004_case_changes.sql']) {
+  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql', '003_moderation_warnings.sql', '004_case_changes.sql', '005_timeouts.sql']) {
     const sql = await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
     await db.exec(sql.replace(/^\uFEFF/, ''));
   }
@@ -1021,4 +1021,27 @@ test('case edits are server-scoped and escaped history does not send notificatio
   const html = await (await history('/cases/1', session)).text();
   assert.ok(html.includes('&lt;script&gt;new&lt;/script&gt;')); assert.ok(!html.includes('<script>new'));
   assert.ok(html.includes('&lt;img')); assert.equal(sends.length, 0);
+});
+
+async function seedTimeoutCase() {
+  await seedCases();
+  await pool.query(`UPDATE moderation_cases SET action='timeout',action_status='rejected',duration_seconds=600,
+    requested_until=NOW()+INTERVAL '10 minutes',dm_status='skipped',log_status='sent',action_error='HTTP_403'
+    WHERE guild_id=$1 AND case_number=1`,[guild]);
+}
+test('native cases display recorded action result separately from DM and log delivery', async () => {
+  await seedTimeoutCase(); const session = await signIn();
+  const detail = await (await history('/cases/1',session)).text();
+  assert.match(detail,/Timeout · <strong>Recorded/); assert.match(detail,/Rejected/);
+  assert.match(detail,/10 minutes/); assert.match(detail,/Not sent \(action not confirmed\)/);
+  assert.match(detail,/not a live timeout-status check/); assert.ok(!detail.includes('Save correction'));
+  const list = await (await history('/cases',session)).text(); assert.match(list,/Timeout · Recorded/); assert.match(list,/Action: Rejected/);
+});
+test('native timeout cases cannot be corrected or voided through crafted web requests', async () => {
+  await seedTimeoutCase(); const session = await signIn(); const token = session.split('=')[1]!;
+  assert.equal((await postCase(session,{ csrf: caseChangeProof(token,1,0,'correct'),revision: '0',
+    reason: 'Attempted edit',new_reason: 'Changed' })).status,409);
+  assert.equal((await postCase(session,{ csrf: caseChangeProof(token,1,0,'void'),revision: '0',
+    reason: 'Attempted void',confirm: '1' },'void')).status,409);
+  assert.equal((await caseRecord()).state,'active'); assert.equal((await changes()).length,0); assert.equal(sends.length,0);
 });

@@ -4,6 +4,8 @@ import pg from 'pg';
 import { port, required, snowflake } from './config.js';
 import { getStaffAccess } from './staff-access.js';
 import { handleStaffAccess } from './handle-staff-access.js';
+import { handleTimeout } from './handle-timeout.js';
+import { timeoutDependencies } from './timeout-discord.js';
 import { handleWarning } from './handle-warning.js';
 import { warningDependencies } from './warning-discord.js';
 import { createDashboardHandler } from './dashboard.js';
@@ -42,6 +44,7 @@ async function main(): Promise<void> {
     }).sort((a, b) => a.name.localeCompare(b.name));
   };
   const warningDeps = warningDependencies(client, guildId, readLogChannels);
+  const timeoutDeps = timeoutDependencies(client, guildId, token, warningDeps);
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
     isBotReady: () => !stopping && client.isReady(),
@@ -96,7 +99,7 @@ async function main(): Promise<void> {
   client.once(Events.ClientReady, () => console.log('Maru is connected to Discord.'));
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-    if (!['ping', 'staff-check', 'staff-access', 'warn', 'case'].includes(interaction.commandName)) return;
+    if (!['ping', 'staff-check', 'staff-access', 'warn', 'case', 'timeout', 'untimeout'].includes(interaction.commandName)) return;
     try {
       if (interaction.guildId !== guildId || !interaction.member) {
         await interaction.reply({
@@ -112,6 +115,10 @@ async function main(): Promise<void> {
 
       // Acknowledge before the database query so a slow query cannot time out the interaction.
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (interaction.commandName === 'timeout' || interaction.commandName === 'untimeout') {
+        await handleTimeout(interaction, pool, guildId, timeoutDeps);
+        return;
+      }
       if (interaction.commandName === 'warn' || interaction.commandName === 'case') {
         await handleWarning(interaction, pool, guildId, warningDeps);
         return;
