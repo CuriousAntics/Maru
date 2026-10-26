@@ -59,4 +59,4 @@ Reference: https://docs.discord.com/developers/topics/oauth2
 
 ## Starboard configuration
 
-The Starboard navigation item opens the multiple-board settings page for configured Admins and Mods. See [starboard-settings.md](starboard-settings.md) for fields, permissions, audit behavior and deployment steps. This increment saves configuration; reaction posting is not active yet.
+The Starboard navigation item opens the multiple-board settings page for configured Admins and Mods. See [starboard-settings.md](starboard-settings.md) for fields, permissions, audit behavior and deployment steps. Reaction posting is available per board through its On/Off setting. See [starboard-reactions.md](starboard-reactions.md) for Message Content Intent setup and live verification.

@@ -10,6 +10,8 @@ import { handleTimeout } from './handle-timeout.js';
 import { timeoutDependencies } from './timeout-discord.js';
 import { handleWarning } from './handle-warning.js';
 import { warningDependencies } from './warning-discord.js';
+import { parseStarboardEvent, enqueueStarboardEvent, startStarboardWorker } from './starboard-worker.js';
+import { starboardRuntimeDependencies } from './starboard-runtime-discord.js';
 import { starboardResources } from './starboard-discord.js';
 import { createDashboardHandler } from './dashboard.js';
 import { dashboardConfig } from './web-security.js';
@@ -28,7 +30,7 @@ async function main(): Promise<void> {
     idleTimeoutMillis: 30000,
     query_timeout: 5000,
   });
-  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent] });
   let stopping = false;
   let webConfig;
   try { webConfig = dashboardConfig(process.env); }
@@ -70,6 +72,13 @@ async function main(): Promise<void> {
       }
     },
   });
+  const starboardWorker = startStarboardWorker(pool, guildId, starboardRuntimeDependencies(client, guildId, token),
+    () => !stopping && client.isReady());
+  client.on(Events.Raw, (packet) => {
+    if (stopping) return;
+    const event = parseStarboardEvent(packet, guildId);
+    if (event) void enqueueStarboardEvent(pool, event).catch(() => console.error('Starboard event could not be saved; observed messages will be rechecked.'));
+  });
   const server = createServer((request, response) => {
     if (request.url !== '/healthz') {
       void dashboard(request, response);
@@ -93,6 +102,7 @@ async function main(): Promise<void> {
     deadline.unref();
     await client.destroy();
     await Promise.allSettled([
+      starboardWorker.stop(),
       pool.end(),
       new Promise<void>((resolve) => server.close(() => resolve())),
     ]);

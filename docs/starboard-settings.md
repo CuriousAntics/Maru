@@ -2,7 +2,7 @@
 
 Open **Starboard** in Maru's staff dashboard. Configured Admins and ordinary Mods may create and edit boards. Current Discord membership and configured staff roles are checked for every request and again inside the save transaction. Native Administrator permission alone does not grant dashboard access.
 
-This increment saves configuration only. Reaction processing, posting, updating and removing Discord messages are not active yet. New boards are stored with enabled=false. No existing Dyno Starboard message is imported, edited, deleted or reposted. Keep the current Starboard bot running until reaction processing and migration are ready.
+Reaction processing is now available for boards explicitly switched On. New boards and existing previously saved boards default to Off. See [starboard-reactions.md](starboard-reactions.md) for the worker, intent setup and live tests. Existing Dyno Starboard messages remain untouched; do not remove production bots before their replacements and migration have been verified.
 
 ## Board options
 
@@ -11,12 +11,13 @@ This increment saves configuration only. Reaction processing, posting, updating 
 - Reaction: one Unicode emoji, including supported multi-codepoint sequences, or a usable custom emoji from this server. Paste the emoji itself, its custom Discord syntax, or a custom emoji ID. The form suggests usable server emoji. Custom emoji are stored by stable ID; Unicode reaction keys ignore presentation-selector differences.
 - Threshold: 1–1000 reactions; the form starts at 3 and staff can choose another value.
 - Eligible channels: explicitly select 1–100 text or announcement channels that Maru can view and read. A board's destination cannot also be a source for that same board. Voice channels, forums and threads are outside this increment.
-- Cross-posting: configured independently per board, default off. A message may appear on multiple boards only when all participating boards allow sharing. The reaction-handling increment will enforce this rule.
+- Cross-posting: configured independently per board, default off. A message may appear on multiple boards only when all participating boards allow sharing. Earlier-created boards take priority when this conflicts with another board.
+- Reaction posting: Off by default; switching On starts handling reactions. Switching Off removes this board’s Maru-managed highlights.
 - Reason: 1–500 characters for every create or edit.
 
 Up to 25 boards may be configured per server in this increment. Multiple boards may share a destination and have different emoji, thresholds or source selections. Creation and editing are supported; deletion/archival controls will follow as needed alongside reaction handling.
 
-Future reaction behavior retains the agreed rules: author self-reactions do not count; posts are removed if the reaction threshold is lost or the source is deleted; a qualifying message can be reposted after removal. These rules are described in the form but are not yet executed by this settings-only change.
+Reaction behavior retains the agreed rules: author self-reactions do not count; posts are removed if the reaction threshold is lost or the source is deleted; a qualifying message can be reposted after removal.
 
 ## Saves, audit and safety
 
@@ -32,14 +33,14 @@ The form preserves missing saved selections and labels them unavailable. Restore
 
 Apply 007_starboard_settings.sql with the existing migration command. Railway's pre-deploy migration command applies the same file. Do not edit applied migrations. This is an additive table migration; the prior bot can keep running during deployment.
 
-No new dependencies, secrets, Railway variables, slash commands, or gateway intents are required. Reaction intents and message-processing requirements will be handled in the next increment. The existing Discord login continues to request only identify; channel/emoji lookups use Maru's bot connection.
+No new dependencies, secrets, Railway variables, or slash commands are required. Reaction handling requires Message Content Intent enabled in the Discord Developer Portal before deployment; see the reaction guide. The existing Discord login continues to request only identify; channel/emoji lookups use Maru's bot connection.
 
 ```powershell
 npm run check
 npm run build
-node --import tsx --test test/staff-access.test.ts test/staff-grants.test.ts test/dashboard.test.ts test/warnings.test.ts test/timeouts.test.ts test/bans.test.ts test/starboard-settings.test.ts
+node --import tsx --test test/staff-access.test.ts test/staff-grants.test.ts test/dashboard.test.ts test/warnings.test.ts test/timeouts.test.ts test/bans.test.ts test/starboard-settings.test.ts test/starboard-reactions.test.ts
 ```
 
 Tests use isolated PostgreSQL and fake Discord resources. They do not create, delete or edit live Discord messages. Coverage includes ordinary Mod access, current-session reauthorization, stale edits, duplicate submits, bounded settings, channel permissions, custom and Unicode emoji, cross-server isolation, atomic audit rollback, no-op edits, persisted configuration, protected forms and output escaping.
 
-After deployment, create a test board in Maru Development, refresh to confirm its saved settings, edit its threshold, and inspect Recent staff activity. Verify ordinary Mods can configure boards, while nonstaff cannot sign in. Do not expect reactions to post messages yet.
+After deployment, create a test board in Maru Development, refresh to confirm its saved settings, edit its threshold, and inspect Recent staff activity. Verify ordinary Mods can configure boards, while nonstaff cannot sign in. Turn posting On and follow the reaction guide to verify live behavior.
