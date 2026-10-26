@@ -54,7 +54,10 @@ export function banDependencies(client: Client, guildId: string, token: string, 
       const result = action === 'ban'
         ? await writer.put(Routes.guildBan(guildId,targetId),{ ...options,body: { delete_message_seconds: deleteSeconds } })
         : await writer.delete(Routes.guildBan(guildId,targetId),options);
-      if (result !== undefined && result !== null) throw new Error('UNEXPECTED_RESPONSE');
+      // @discordjs/rest parses Discord's empty 204 response as an empty ArrayBuffer.
+      if (result !== undefined && result !== null && !(result instanceof ArrayBuffer && result.byteLength === 0)) {
+        throw new Error('UNEXPECTED_RESPONSE');
+      }
     },
   };
 }
