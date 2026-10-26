@@ -1,14 +1,15 @@
+import type { PendingBoardDeletion } from './starboard-delete.js';
 import { layout } from './web-pages.js';
 import { escapeHtml } from './web-security.js';
 import type { StarboardBoard, StarboardResources } from './starboard-settings.js';
 
-export function starboardListPage(data: { boards: StarboardBoard[]; resources: StarboardResources; nonce: string; logout: string }): string {
+export function starboardListPage(data: { boards: StarboardBoard[]; resources: StarboardResources; nonce: string; logout: string; deletions?: PendingBoardDeletion[]; notice?: string }): string {
   const channelName = (id: string) => {
     const channel = data.resources.channels.find((entry) => entry.id === id);
     return channel ? `#${channel.name}` : `Unavailable channel (${id})`;
   };
-  const cards = data.boards.map((board) => `<section class="card"><h2>${escapeHtml(board.name)}</h2><p>${escapeHtml(board.emoji)} · ${board.threshold} reactions</p><p>Destination: ${escapeHtml(channelName(board.destination_channel_id))}</p><p class="small">${board.enabled ? 'Posting on' : 'Posting off'} · ${board.posted_count ?? 0} managed highlights · ${board.source_channel_ids.length} eligible channels · Cross-posting ${board.allow_crosspost ? 'allowed' : 'off'} · Revision ${board.revision}</p>${board.unconfirmed_posts ? '<p role="alert">A highlight’s delivery needs review. Maru will check the destination without sending another copy.</p>' : ''}<a class="button" href="/starboards/${board.board_id}">Edit board</a></section>`).join('');
-  return layout('Starboard',`<div class="hero"><div class="eyebrow">Community highlights</div><h1>Starboard</h1><p>Create separate boards for different reactions and channels.</p></div><div class="notice">Turn posting on for each board when ready. Only Maru-managed highlights are updated or removed; existing posts from other bots remain untouched.</div><p><a class="button" href="/starboards/new">Create board</a></p><div class="grid">${cards || '<p>No boards configured yet.</p>'}</div>`,data.nonce,data.logout);
+  const cards = data.boards.map((board) => `<section class="card"><h2>${escapeHtml(board.name)}</h2><p>${escapeHtml(board.emoji)} · ${board.threshold} reactions</p><p>Destination: ${escapeHtml(channelName(board.destination_channel_id))}</p><p class="small">${board.enabled ? 'Posting on' : 'Posting off'} · ${board.posted_count ?? 0} managed highlights · ${board.source_channel_ids.length} eligible channels · Cross-posting ${board.allow_crosspost ? 'allowed' : 'off'} · Revision ${board.revision}</p>${board.unconfirmed_posts ? '<p role="alert">A highlight’s delivery needs review. Maru will check the destination without sending another copy.</p>' : ''}<a class="button" href="/starboards/${board.board_id}">Edit board</a> <a href="/starboards/${board.board_id}/delete-confirm">Delete board</a></section>`).join('');
+  return layout('Starboard',`<div class="hero"><div class="eyebrow">Community highlights</div><h1>Starboard</h1><p>Create separate boards for different reactions and channels.</p></div><div class="notice">Turn posting on for each board when ready. Only Maru-managed highlights are updated or removed; existing posts from other bots remain untouched.</div>${data.notice ? `<div class="notice" role="status">${escapeHtml(data.notice)}</div>` : ''}${(data.deletions ?? []).map((entry) => `<div class="notice" role="status">Deleted board <strong>${escapeHtml(entry.name)}</strong>: ${entry.pending_count} highlight(s) awaiting removal.${entry.uncertain_count ? ' An earlier delivery is uncertain; Maru will look for its copy before removing it.' : ' Check destination permissions if cleanup remains pending.'}</div>`).join('')}<p><a class="button" href="/starboards/new">Create board</a></p><div class="grid">${cards || '<p>No boards configured yet.</p>'}</div>`,data.nonce,data.logout);
 }
 export function starboardFormPage(data: { boardId: string; board?: StarboardBoard; resources: StarboardResources; csrf: string; nonce: string; logout: string }): string {
   const { board,resources } = data;
@@ -29,9 +30,20 @@ export function starboardFormPage(data: { boardId: string; board?: StarboardBoar
     <label for="threshold">Reaction threshold</label><input id="threshold" name="threshold" type="number" min="1" max="1000" required value="${board?.threshold ?? 3}">
     <fieldset class="channel-choices"><legend>Eligible source channels (choose 1–100)</legend>${sources || '<p>No supported channels available.</p>'}</fieldset><p class="small">Sources need View Channel and Read Message History. Choose text or announcement channels; the destination cannot also be a source for this board. Messages from these sources will be visible in the destination when posting is on. Remove unavailable sources or restore bot access before saving.</p>
     <label for="allow_crosspost">Allow a source message on multiple boards?</label><select id="allow_crosspost" name="allow_crosspost"><option value="false"${board?.allow_crosspost ? '' : ' selected'}>No</option><option value="true"${board?.allow_crosspost ? ' selected' : ''}>Yes</option></select><p class="small">A message can appear on multiple boards only when each participating board allows sharing. Earlier-created boards take priority when settings conflict.</p>
-    <label for="reason">Reason for change</label><textarea id="reason" name="reason" required maxlength="500" placeholder="Why are you creating or changing this board?"></textarea><button type="submit">${board ? 'Save board' : 'Create board'}</button></form></section><p><a href="/starboards">Back to boards</a></p>`,data.nonce,data.logout);
+    <label for="reason">Reason for change</label><textarea id="reason" name="reason" required maxlength="500" placeholder="Why are you creating or changing this board?"></textarea><button type="submit">${board ? 'Save board' : 'Create board'}</button></form></section>${board ? `<p><a href="/starboards/${board.board_id}/delete-confirm">Delete this board</a></p>` : ''}<p><a href="/starboards">Back to boards</a></p>`,data.nonce,data.logout);
 }
 
 export function starboardErrorPage(text: string, nonce: string, logout: string): string {
   return layout('Starboard settings not saved', `<div class="hero"><h1>Settings not saved</h1><p role="alert">${escapeHtml(text)}</p><a class="button" href="/starboards">Back to Starboard</a></div>`,nonce,logout);
+}
+
+export function starboardDeletePage(data: { board: StarboardBoard; nonce: string; logout: string; csrf: string }): string {
+  const board = data.board;
+  return layout('Delete Starboard', `<div class="hero"><div class="eyebrow">Starboard</div><h1>Delete ${escapeHtml(board.name)}</h1><p>This removes the board from the workspace and stops it from posting. Its audit history remains available.</p></div><section class="card"><form method="post" action="/starboards/${board.board_id}/delete"><input type="hidden" name="csrf" value="${escapeHtml(data.csrf)}"><input type="hidden" name="revision" value="${board.revision}">
+    <label class="channel-choice"><input type="checkbox" name="remove_highlights" value="true">Also remove this board’s Maru highlights from Discord</label>
+    <p class="small">Unchecked: keep existing highlight messages as unmanaged snapshots. They will no longer update or disappear when reactions change or the source is deleted. Checked: Maru will remove only the copies it manages for this board; cleanup may take time. Original source messages, other boards, and other bots’ posts are not deleted.</p>
+    <p class="small">${board.posted_count ?? 0} confirmed highlight(s)${board.unconfirmed_posts ? `; ${board.unconfirmed_posts} delivery or deliveries need review` : ''}.</p>
+    <label for="confirmation">Type the board name: ${escapeHtml(board.name)}</label><input id="confirmation" name="confirmation" required maxlength="60" autocomplete="off">
+    <label for="delete_reason">Reason for deletion</label><textarea id="delete_reason" name="reason" required maxlength="500"></textarea>
+    <button type="submit">Delete board</button> <a href="/starboards/${board.board_id}">Cancel</a></form></section>`,data.nonce,data.logout);
 }

@@ -73,8 +73,8 @@ export function createDashboardHandler(options: Options) {
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
     const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases'];
-    const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save))?)?$/.test(path);
-    const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save)$/.test(path);
+    const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save|delete|delete-confirm))?)?$/.test(path);
+    const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save|delete)$/.test(path);
     const caseDetail = /^\/cases\/([^/]+)$/.exec(path);
     const caseMutation = /^\/cases\/([^/]+)\/(correct|void)$/.exec(path);
     if (!routes.includes(path) && !caseDetail && !caseMutation && !starboardPath) {

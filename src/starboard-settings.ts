@@ -11,6 +11,7 @@ export type BoardValues = {
 };
 export type StarboardBoard = BoardValues & {
   guild_id: string; board_id: string; enabled: boolean; revision: number;
+  deleted_at?: Date | null; deleted_by?: string | null; delete_reason?: string | null; delete_remove_highlights?: boolean;
   unconfirmed_posts?: number; posted_count?: number;
   created_by: string; updated_by: string; created_at: Date; updated_at: Date;
 };
@@ -36,7 +37,7 @@ export function resolveBoardEmoji(text: string, emojis: StarboardEmoji[]): { emo
 export async function loadStarboards(pool: Pick<Pool,'query'>, guildId: string): Promise<StarboardBoard[]> {
   return (await pool.query<StarboardBoard>(`SELECT b.*, (SELECT count(*)::int FROM starboard_posts p WHERE p.guild_id=b.guild_id AND p.board_id=b.board_id AND p.state='creating') AS unconfirmed_posts,
     (SELECT count(*)::int FROM starboard_posts p WHERE p.guild_id=b.guild_id AND p.board_id=b.board_id AND p.state='posted') AS posted_count
-    FROM starboard_boards b WHERE b.guild_id=$1 ORDER BY b.created_at,b.board_id`,[guildId])).rows;
+    FROM starboard_boards b WHERE b.guild_id=$1 AND b.deleted_at IS NULL ORDER BY b.created_at,b.board_id`,[guildId])).rows;
 }
 export function boardSnapshot(board: BoardValues): BoardValues {
   return { name: board.name,destination_channel_id: board.destination_channel_id,emoji: board.emoji,emoji_key: board.emoji_key,
@@ -73,6 +74,7 @@ export async function saveStarboard(pool: Pick<Pool,'connect'>, input: {
     const roles = await input.readMemberRoles(input.actorId);
     if (!roles || await getStaffAccess(client,input.guildId,input.actorId,roles) === 'none') throw new StarboardSettingsError('STAFF_REQUIRED');
     const existing = (await client.query<StarboardBoard>('SELECT * FROM starboard_boards WHERE guild_id=$1 AND board_id=$2 FOR UPDATE',[input.guildId,input.boardId])).rows[0];
+    if (existing?.deleted_at) throw new StarboardSettingsError('BOARD_NOT_FOUND');
     if (input.action === 'save' && !existing) throw new StarboardSettingsError('BOARD_NOT_FOUND');
     if (existing && existing.revision !== input.revision) throw new StarboardSettingsError('STALE_BOARD');
     // An authorized staff member can switch posting off without repairing unavailable channels first.
@@ -96,11 +98,11 @@ export async function saveStarboard(pool: Pick<Pool,'connect'>, input: {
       await client.query('COMMIT'); transaction = false; return 'unchanged';
     }
     if (input.action === 'create' && existing) throw new StarboardSettingsError('STALE_BOARD');
-    const duplicate = await client.query('SELECT board_id FROM starboard_boards WHERE guild_id=$1 AND lower(name)=lower($2) AND board_id<>$3',
+    const duplicate = await client.query('SELECT board_id FROM starboard_boards WHERE guild_id=$1 AND lower(name)=lower($2) AND board_id<>$3 AND deleted_at IS NULL',
       [input.guildId,name,input.boardId]);
     if (duplicate.rowCount) throw new StarboardSettingsError('DUPLICATE_NAME');
     if (!existing) {
-      const count = await client.query<{ count: number }>('SELECT count(*)::int AS count FROM starboard_boards WHERE guild_id=$1',[input.guildId]);
+      const count = await client.query<{ count: number }>('SELECT count(*)::int AS count FROM starboard_boards WHERE guild_id=$1 AND deleted_at IS NULL',[input.guildId]);
       if (count.rows[0]!.count >= 25) throw new StarboardSettingsError('BOARD_LIMIT');
       await client.query(`INSERT INTO starboard_boards
         (guild_id,board_id,name,destination_channel_id,emoji,emoji_key,threshold,source_channel_ids,allow_crosspost,enabled,created_by,updated_by)

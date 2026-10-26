@@ -15,7 +15,7 @@ Reaction processing is now available for boards explicitly switched On. New boar
 - Reaction posting: Off by default; switching On starts handling reactions. Switching Off removes this board’s Maru-managed highlights.
 - Reason: 1–500 characters for every create or edit.
 
-Up to 25 boards may be configured per server in this increment. Multiple boards may share a destination and have different emoji, thresholds or source selections. Creation and editing are supported; deletion/archival controls will follow as needed alongside reaction handling.
+Up to 25 boards may be configured per server in this increment. Multiple boards may share a destination and have different emoji, thresholds or source selections. Deletion is available with a confirmation and optional highlight cleanup; see [starboard-deletion.md](starboard-deletion.md).
 
 Reaction behavior retains the agreed rules: author self-reactions do not count; posts are removed if the reaction threshold is lost or the source is deleted; a qualifying message can be reposted after removal.
 
