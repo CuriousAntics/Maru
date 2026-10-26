@@ -1,5 +1,5 @@
 import { REST, Routes } from 'discord.js';
-import { ping, staffCheck, staffAccess, warn, caseLookup, timeout, untimeout } from './commands.js';
+import { ping, staffCheck, staffAccess, warn, caseLookup, timeout, untimeout, ban, unban } from './commands.js';
 import { required, snowflake } from './config.js';
 
 try {
@@ -7,12 +7,12 @@ try {
   const guildId = snowflake('DISCORD_TEST_GUILD_ID');
   const rest = new REST({ version: '10' }).setToken(required('DISCORD_TOKEN'));
   // Upsert these commands individually, preserving unrelated commands.
-  for (const command of [ping, staffCheck, staffAccess, warn, caseLookup, timeout, untimeout]) {
+  for (const command of [ping, staffCheck, staffAccess, warn, caseLookup, timeout, untimeout, ban, unban]) {
     await rest.post(Routes.applicationGuildCommands(applicationId, guildId), {
       body: command.toJSON(),
     });
   }
-  console.log('Registered /ping, /staff-check, /staff-access, /warn, /case, /timeout, and /untimeout in the configured test server.');
+  console.log('Registered /ping, /staff-check, /staff-access, /warn, /case, /timeout, /untimeout, /ban, and /unban in the configured test server.');
 } catch {
   console.error('Command registration failed. Check the TEST application/server IDs, token, installation, and network access.');
   process.exitCode = 1;

@@ -75,7 +75,7 @@ let handler: ReturnType<typeof makeHandler>;
 const server = createServer((request, response) => { void handler(request, response); });
 
 before(async () => {
-  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql', '003_moderation_warnings.sql', '004_case_changes.sql', '005_timeouts.sql']) {
+  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql', '003_moderation_warnings.sql', '004_case_changes.sql', '005_timeouts.sql', '006_bans.sql']) {
     const sql = await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
     await db.exec(sql.replace(/^\uFEFF/, ''));
   }
@@ -1044,4 +1044,37 @@ test('native timeout cases cannot be corrected or voided through crafted web req
   assert.equal((await postCase(session,{ csrf: caseChangeProof(token,1,0,'void'),revision: '0',
     reason: 'Attempted void',confirm: '1' },'void')).status,409);
   assert.equal((await caseRecord()).state,'active'); assert.equal((await changes()).length,0); assert.equal(sends.length,0);
+});
+
+async function seedBanCase(action: 'ban' | 'unban' = 'ban') {
+  await seedCases();
+  await pool.query(`UPDATE moderation_cases SET action=$2,action_status='applied',delete_message_seconds=$3,
+    dm_status=$4,log_status='sent' WHERE guild_id=$1 AND case_number=1`,
+    [guild,action,action === 'ban' ? 86400 : null,action === 'ban' ? 'sent' : 'skipped']);
+}
+test('ban history distinguishes pre-ban notice from action result and deletion request', async () => {
+  await seedBanCase(); const session = await signIn();
+  const detail = await (await history('/cases/1',session)).text();
+  assert.match(detail,/Ban · <strong>Recorded/); assert.match(detail,/Applied/);
+  assert.match(detail,/Requested message deletion: 1 day/); assert.match(detail,/a sent DM does not confirm the ban/);
+  assert.ok(!detail.includes('Requested end UTC')); assert.ok(!detail.includes('Save correction'));
+  const list = await (await history('/cases',session)).text(); assert.match(list,/Ban · Recorded/); assert.match(list,/Action: Applied/);
+});
+test('unban detail explains skipped DM and does not imply member rejoined or messages restored', async () => {
+  await seedBanCase('unban'); const session = await signIn();
+  const detail = await (await history('/cases/1',session)).text();
+  assert.match(detail,/Unban · <strong>Recorded/); assert.match(detail,/Not sent for unbans/);
+  assert.match(detail,/do not send a DM, restore deleted messages, or rejoin the member/);
+  assert.match(detail,/Requested message deletion: Not applicable/);
+});
+test('crafted correction and void requests cannot change ban or unban cases', async () => {
+  await seedBanCase();
+  for (const action of ['ban','unban'] as const) {
+    await pool.query('UPDATE moderation_cases SET action=$2,delete_message_seconds=$3 WHERE guild_id=$1 AND case_number=1',[guild,action,action === 'ban' ? 86400 : null]);
+    const session = await signIn(); const token = session.split('=')[1]!;
+    assert.equal((await postCase(session,{ csrf: caseChangeProof(token,1,0,'correct'),revision: '0',reason: 'Edit',new_reason: 'Changed' })).status,409);
+    assert.equal((await postCase(session,{ csrf: caseChangeProof(token,1,0,'void'),revision: '0',reason: 'Void',confirm: '1' },'void')).status,409);
+    assert.equal((await caseRecord()).state,'active'); assert.equal((await changes()).length,0);
+  }
+  assert.equal(sends.length,0);
 });

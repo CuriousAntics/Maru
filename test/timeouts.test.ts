@@ -79,7 +79,7 @@ async function events() {
   return (await db.query<{ event_type: string; details: Record<string,unknown> }>('SELECT event_type,details FROM audit_events ORDER BY event_id')).rows;
 }
 before(async () => {
-  for (const name of ['001_foundation.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql']) {
+  for (const name of ['001_foundation.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql', '006_bans.sql']) {
     await db.exec((await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8')).replace(/^\uFEFF/,''));
   }
 });

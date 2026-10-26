@@ -56,3 +56,5 @@ Live checks in the private test server:
 7. Confirm an unmapped member cannot issue `/warn` or read `/case`. Ordinary Mods should be able to warn only an eligible lower-ranked ordinary member.
 
 These checks create real persistent warning cases in the test server. The dashboard now supports [case corrections and voiding](case-changes.md), with ownership permissions and retained history. Manual [timeouts and timeout removal](timeouts.md) are now available as separate native actions. Imports, bans, and website warning creation are not included yet.
+
+Manual bans and unbans are documented in [bans.md](bans.md). These native cases are read only; their pre-ban DM and Discord action results are recorded separately.
