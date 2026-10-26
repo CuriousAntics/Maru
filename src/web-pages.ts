@@ -1,3 +1,7 @@
+import type { WarningCase } from './warnings.js';
+import type { CaseFilter } from './case-history.js';
+import { caseHistoryUrl } from './case-history.js';
+import { deliveryLabel } from './handle-warning.js';
 import type { LogChannel } from './server-settings.js';
 import { escapeHtml } from './web-security.js';
 
@@ -18,13 +22,13 @@ th{padding:16px 20px;color:#aab4ad;font-weight:500;font-size:11px;letter-spacing
 td{padding:18px 20px;border-top:1px solid #303837;vertical-align:top;overflow-wrap:anywhere;max-width:300px}.mono{font-family:Consolas,monospace;font-size:12px}
 button,.button{display:inline-block;background:#e6ad73;color:#191b1b;border:0;border-radius:9px;padding:12px 18px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none}
 button.secondary{background:transparent;color:#c7d0cb;border:1px solid #414c47;padding:9px 15px}form{margin:0}
-label{display:block;margin:20px 0 8px}select,textarea{width:100%;max-width:650px;background:#101315;color:#eef0eb;border:1px solid #53615a;border-radius:8px;padding:12px;font:inherit}textarea{display:block;min-height:90px;margin-bottom:20px}nav{display:flex;gap:20px;margin-top:24px}\n.notice{padding:18px 20px;border:1px solid #424a3c;border-radius:12px;color:#c0cbb5;background:#1d231e;margin:24px 0;font-size:13px;line-height:1.6}
-footer{font-size:12px;color:#8b9890;padding-top:30px}.empty{padding:32px;color:#9fada5}.login{max-width:720px}.login .card{margin-top:12px;padding:30px}.tag{color:#e6bd91}
+label{display:block;margin:20px 0 8px}input:not([type="hidden"]),select,textarea{width:100%;max-width:650px;background:#101315;color:#eef0eb;border:1px solid #53615a;border-radius:8px;padding:12px;font:inherit}textarea{display:block;min-height:90px;margin-bottom:20px}nav{display:flex;gap:20px;margin-top:24px}\n.notice{padding:18px 20px;border:1px solid #424a3c;border-radius:12px;color:#c0cbb5;background:#1d231e;margin:24px 0;font-size:13px;line-height:1.6}
+.case-reason{white-space:pre-wrap;overflow-wrap:anywhere;max-width:none;color:#eef0eb}.status{display:inline-block;padding:5px 9px;border:1px solid #49544f;border-radius:7px;font-size:12px}.pagination{display:flex;gap:22px;margin-top:24px;flex-wrap:wrap}.filter{margin-bottom:26px}.filter button{margin:12px 14px 0 0}nav{flex-wrap:wrap}hr{border:0;border-top:1px solid #333b3a;margin:25px 0}\nfooter{font-size:12px;color:#8b9890;padding-top:30px}.empty{padding:32px;color:#9fada5}.login{max-width:720px}.login .card{margin-top:12px;padding:30px}.tag{color:#e6bd91}
 @media(max-width:700px){.shell{padding:24px 18px}.grid{grid-template-columns:1fr}.hero{padding-top:38px}td,th{padding:13px}.pill{font-size:10px}header{gap:10px}}
 `;
 
 function layout(title: string, body: string, nonce: string, logout?: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Maru</title><style nonce="${nonce}">${css}</style></head><body><main class="shell"><header><a class="brand" href="/"><span class="mark">M</span>Maru<span class="pill">Development workspace</span></a>${logout ? `<form method="post" action="/auth/logout"><input type="hidden" name="csrf" value="${escapeHtml(logout)}"><button class="secondary" type="submit">Sign out</button></form>` : '<span class="muted">Staff dashboard</span>'}</header>${body}<footer>Maru · Community management</footer></main></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Maru</title><style nonce="${nonce}">${css}</style></head><body><main class="shell"><header><a class="brand" href="/"><span class="mark">M</span>Maru<span class="pill">Development workspace</span></a>${logout ? `<form method="post" action="/auth/logout"><input type="hidden" name="csrf" value="${escapeHtml(logout)}"><button class="secondary" type="submit">Sign out</button></form>` : '<span class="muted">Staff dashboard</span>'}</header>${logout ? '<nav aria-label="Staff navigation"><a href="/dashboard">Overview</a><a href="/cases">Moderation cases</a><a href="/settings">Server settings</a></nav>' : ''}${body}<footer>Maru · Community management</footer></main></body></html>`;
 }
 
 export function loginPage(nonce: string): string {
@@ -51,8 +55,8 @@ export function dashboardPage(data: {
     const reason = typeof event.details.reason === 'string' ? event.details.reason : '—';
     const settingChange = event.event_type === 'SERVER_SETTINGS_CHANGED' && event.details.setting === 'moderation_log_channel_id'
       ? `<div class="small mono">Moderation log channel: ${escapeHtml(event.details.previous_channel_id ?? 'Not configured')} → ${escapeHtml(event.details.channel_id ?? 'Not configured')}</div>` : '';
-    const caseLabel = Number.isInteger(event.details.case_number)
-      ? `<div class="small">Case #${escapeHtml(event.details.case_number)}</div>` : '';
+    const caseLabel = Number.isInteger(event.details.case_number) && Number(event.details.case_number) > 0 && Number(event.details.case_number) <= 2147483647
+      ? `<div class="small"><a href="/cases/${event.details.case_number}">Case #${escapeHtml(event.details.case_number)}</a></div>` : '';
     const target = event.details.target_user_id ?? event.details.role_id ?? event.details.channel_id ?? '—';
     return `<tr><td><span class="tag">${escapeHtml(event.event_type.replaceAll('_', ' ').toLowerCase())}</span><div class="small">${escapeHtml(reason)}</div>${settingChange}${caseLabel}</td><td class="mono">${escapeHtml(event.actor_id)}</td><td class="mono">${escapeHtml(target)}</td><td>${escapeHtml(new Date(event.created_at).toISOString().replace('T', ' ').slice(0, 19))}</td></tr>`;
   }).join('');
@@ -67,9 +71,36 @@ export function settingsPage(data: {
   const currentLabel = current ? `#${current.name}` : data.channelId ? `Unavailable channel (${data.channelId})` : 'Not configured';
   const choices = data.channels.map((channel) => `<option value="${escapeHtml(channel.id)}"${channel.id === data.channelId ? ' selected' : ''}${!channel.usable ? ' disabled' : ''}>#${escapeHtml(channel.name)}${channel.usable ? '' : ' (missing bot permissions)'}</option>`).join('');
   const missing = data.channelId && !current ? `<option value="${escapeHtml(data.channelId)}" selected disabled>${escapeHtml(currentLabel)}</option>` : '';
-  return layout('Server settings', `<nav><a href="/dashboard">Overview</a><a href="/settings">Server settings</a></nav><div class="hero"><div class="eyebrow">Server configuration</div><h1>Server settings</h1><p>Choose where Maru will send moderation logs.</p></div>
+  return layout('Server settings', `<div class="hero"><div class="eyebrow">Server configuration</div><h1>Server settings</h1><p>Choose where Maru will send moderation logs.</p></div>
     ${data.notice ? `<div class="notice" role="status">${escapeHtml(data.notice)}</div>` : ''}
     ${data.error ? `<div class="notice" role="alert">${escapeHtml(data.error)} <a href="/settings">Reload settings</a></div>` : `<section class="card"><h2>Moderation log channel</h2><p>Current destination: <strong>${escapeHtml(currentLabel)}</strong></p>
     <p class="small">This saves the destination for upcoming moderation features. Automatic moderation logs are not active yet. You can send a test embed to verify delivery. Settings changes are recorded under Recent staff activity.</p>
     ${data.access === 'admin' ? `<form method="post" action="/settings"><input type="hidden" name="csrf" value="${escapeHtml(data.csrf)}"><input type="hidden" name="previous_channel_id" value="${escapeHtml(data.channelId ?? '')}"><label for="channel_id">Destination channel</label><select id="channel_id" name="channel_id"><option value=""${data.channelId === null ? ' selected' : ''}>Not configured</option>${missing}${choices}</select><p class="small">Maru needs View Channel, Send Messages, and Embed Links. Only text and announcement channels are supported.</p><label for="reason">Reason for change</label><textarea id="reason" name="reason" required maxlength="500" placeholder="Why are you changing the log destination?"></textarea><button type="submit">Save settings</button></form>${data.channelId && current?.usable && data.testRequestId && data.testCsrf ? `<hr><h3>Test delivery</h3><p>This sends one test embed to the saved destination above. Save any destination changes first. No moderation action is performed.</p><form method="post" action="/settings/test-log"><input type="hidden" name="csrf" value="${escapeHtml(data.testCsrf)}"><input type="hidden" name="request_id" value="${escapeHtml(data.testRequestId)}"><input type="hidden" name="channel_id" value="${escapeHtml(data.channelId)}"><button class="secondary" type="submit">Send test log</button></form>` : '<p class="small">Save an available log channel to enable test delivery.</p>'}` : '<p>Only Admins and Mods granted full access can change these settings.</p>'}</section>`}`, data.nonce, data.logoutCsrf);
+}
+
+function caseTime(value: Date): string {
+  return new Date(value).toISOString().replace('T', ' ').slice(0, 19);
+}
+function statusLabel(status: WarningCase['dm_status']): string {
+  return `<span class="status">${escapeHtml(deliveryLabel(status))}</span>`;
+}
+export function caseHistoryPage(data: {
+  cases: WarningCase[]; hasOlder: boolean; filter: CaseFilter; csrf: string; nonce: string; error?: string;
+}): string {
+  const rows = data.cases.map((record) => `<tr><td><a href="/cases/${record.case_number}">Case #${record.case_number}</a><div class="small">Warning</div><div class="small">${escapeHtml(record.reason.slice(0, 100))}${record.reason.length > 100 ? '…' : ''}</div></td><td class="mono"><a href="${escapeHtml(caseHistoryUrl({ memberId: record.target_user_id }))}">${escapeHtml(record.target_user_id)}</a></td><td class="mono">${escapeHtml(record.actor_id)}</td><td>${statusLabel(record.dm_status)}<div class="small">Log: ${escapeHtml(deliveryLabel(record.log_status))}</div></td><td>${caseTime(record.created_at)}</td></tr>`).join('');
+  const last = data.cases.at(-1);
+  const older = data.hasOlder && last ? `<a href="${escapeHtml(caseHistoryUrl({ memberId: data.filter.memberId, before: last.case_number }))}">Older cases →</a>` : '';
+  return layout('Moderation cases', `<div class="hero"><div class="eyebrow">Moderation history</div><h1>Moderation cases</h1><p>Saved warnings and their delivery results. Times are shown in UTC.</p></div>
+    <form class="card filter" method="get" action="/cases"><label for="member">Filter by member ID</label><input type="text" id="member" name="member" inputmode="numeric" pattern="[0-9]{17,20}" maxlength="20" value="${escapeHtml(data.filter.memberId ?? '')}" placeholder="Discord member ID"><div><button type="submit">Apply filter</button><a href="/cases">Clear filter</a></div></form>
+    ${data.error ? `<div class="notice" role="alert">${escapeHtml(data.error)} <a href="/cases">Back to cases</a></div>` :
+      `<div class="section-title"><h2>${data.filter.memberId ? 'Member history' : 'Latest cases'}</h2><span class="muted">Up to 20 cases per page</span></div><div class="table-wrap"><table><thead><tr><th>Case and reason</th><th>Member ID</th><th>Staff ID</th><th>DM and log delivery</th><th>Created UTC</th></tr></thead><tbody>${rows || `<tr><td colspan="5" class="empty">${data.filter.before ? 'No older cases found.' : data.filter.memberId ? 'No cases found for this member.' : 'No moderation cases recorded yet.'}</td></tr>`}</tbody></table></div><div class="pagination">${data.filter.before ? `<a href="${escapeHtml(caseHistoryUrl({ memberId: data.filter.memberId }))}">Newest cases</a>` : ''}${older}</div>`}`, data.nonce, data.csrf);
+}
+
+export function caseDetailPage(data: { record: WarningCase; csrf: string; nonce: string }): string {
+  const record = data.record;
+  return layout(`Case #${record.case_number}`, `<div class="hero"><div class="eyebrow">Moderation case</div><h1>Case #${record.case_number}</h1><p>Warning · Created ${caseTime(record.created_at)} UTC</p></div>
+    <div class="grid"><section class="card"><div class="label">Member ID</div><div class="mono">${escapeHtml(record.target_user_id)}</div><p class="small"><a href="${escapeHtml(caseHistoryUrl({ memberId: record.target_user_id }))}">View member history</a></p></section><section class="card"><div class="label">Staff ID</div><div class="mono">${escapeHtml(record.actor_id)}</div></section><section class="card"><div class="label">Server</div><div>${escapeHtml(record.guild_name)}</div><div class="small mono">${escapeHtml(record.guild_id)}</div></section></div>
+    <section class="card"><h2>Reason</h2><p class="case-reason">${escapeHtml(record.reason)}</p></section>
+    <div class="grid"><section class="card"><div class="label">Member DM</div>${statusLabel(record.dm_status)}<div class="small mono">Message ID: ${escapeHtml(record.dm_message_id ?? 'Not recorded')}</div></section><section class="card"><div class="label">Moderation log</div>${statusLabel(record.log_status)}<div class="small mono">Channel ID: ${escapeHtml(record.log_channel_id ?? 'Not configured')}</div><div class="small mono">Message ID: ${escapeHtml(record.log_message_id ?? 'Not recorded')}</div></section></div>
+    <div class="notice">A warning remains saved regardless of delivery status. Sent means Discord confirmed message creation, not that the member read it. Not confirmed means the message may have arrived; it is not automatically resent.</div><a href="/cases">Back to all cases</a>`, data.nonce, data.csrf);
 }

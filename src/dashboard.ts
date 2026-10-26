@@ -5,7 +5,8 @@ import {
   cookie, cookieName, digest, equal, logoutProof, randomToken, readCookie, settingsProof, testLogProof, validToken,
 } from './web-security.js';
 import type { DashboardConfig } from './web-security.js';
-import { dashboardPage, loginPage, messagePage, settingsPage } from './web-pages.js';
+import { dashboardPage, loginPage, messagePage, settingsPage, caseHistoryPage, caseDetailPage } from './web-pages.js';
+import { CaseHistoryError, parseCaseFilter, parseCaseNumber, loadCaseHistory, loadCaseDetail } from './case-history.js';
 import { sendTestLog } from './test-log.js';
 import type { SendTestMessage } from './test-log.js';
 import { logChannelId, saveLogChannel, SettingsError } from './server-settings.js';
@@ -67,8 +68,9 @@ export function createDashboardHandler(options: Options) {
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
-    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log'];
-    if (!routes.includes(path)) {
+    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases'];
+    const caseDetail = /^\/cases\/([^/]+)$/.exec(path);
+    if (!routes.includes(path) && !caseDetail) {
       message(response, 404, 'Page not found', 'This page is not available.');
       return;
     }
@@ -249,6 +251,29 @@ export function createDashboardHandler(options: Options) {
       await pool.query('DELETE FROM dashboard_sessions WHERE token_hash = $1', [digest(sessionToken)]);
       response.setHeader('Set-Cookie', cookie(sessionName, '', 0, config.secure));
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
+      return;
+    }
+    if (path === '/cases' || caseDetail) {
+      try {
+        if (caseDetail) {
+          const number = parseCaseNumber(caseDetail[1]!);
+          const record = await loadCaseDetail(pool, guildId, number);
+          if (!record) {
+            html(response, 404, (nonce) => caseHistoryPage({ cases: [], hasOlder: false, filter: {},
+              nonce, csrf: logoutProof(sessionToken), error: 'No case with that number exists in this server.' }));
+            return;
+          }
+          html(response, 200, (nonce) => caseDetailPage({ record, nonce, csrf: logoutProof(sessionToken) }));
+        } else {
+          const filter = parseCaseFilter(new URL(request.url ?? '/', config.origin).searchParams);
+          const page = await loadCaseHistory(pool, guildId, filter);
+          html(response, 200, (nonce) => caseHistoryPage({ ...page, filter, nonce, csrf: logoutProof(sessionToken) }));
+        }
+      } catch (error) {
+        if (!(error instanceof CaseHistoryError)) throw error;
+        html(response, 400, (nonce) => caseHistoryPage({ cases: [], hasOlder: false, filter: {},
+          nonce, csrf: logoutProof(sessionToken), error: error.message }));
+      }
       return;
     }
     if (path === '/settings/test-log') {

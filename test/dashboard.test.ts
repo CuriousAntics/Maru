@@ -73,7 +73,7 @@ let handler: ReturnType<typeof makeHandler>;
 const server = createServer((request, response) => { void handler(request, response); });
 
 before(async () => {
-  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql']) {
+  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql', '003_moderation_warnings.sql']) {
     const sql = await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
     await db.exec(sql.replace(/^\uFEFF/, ''));
   }
@@ -85,7 +85,7 @@ beforeEach(async () => {
   failTestAudit = undefined; sendFailure = undefined; sends = []; botReady = true;
   channels = [{ id: channelId, name: 'logs', usable: true }, { id: secondChannel, name: 'staff-logs', usable: true }];
   roles = [adminRole]; memberFailure = false; exchangeFailure = false; exchanges = 0; displayName = 'Miranda';
-  await db.exec('TRUNCATE dashboard_login_attempts, dashboard_sessions, audit_events, staff_access_grants, staff_roles, guild_settings RESTART IDENTITY');
+  await db.exec('TRUNCATE moderation_cases, guild_case_counters, dashboard_login_attempts, dashboard_sessions, audit_events, staff_access_grants, staff_roles, guild_settings RESTART IDENTITY');
   await pool.query('INSERT INTO guild_settings (guild_id) VALUES ($1)', [guild]);
   await pool.query(`INSERT INTO staff_roles (guild_id, role_id, access_level)
     VALUES ($1, $2, 'admin'), ($1, $3, 'moderator')`, [guild, adminRole, modRole]);
@@ -695,4 +695,170 @@ test('revoking a full-access grant during test authorization prevents delivery',
   };
   assert.equal((await postTest(session, fields)).status, 403);
   assert.equal(sends.length, 0); assert.equal((await testEvents()).length, 0);
+});
+
+async function seedCases(count = 1, selectedGuild = guild, start = 1, target = '800000000000000001') {
+  await pool.query(`INSERT INTO moderation_cases (guild_id, case_number, request_id, action, actor_id,
+    target_user_id, reason, guild_name, log_channel_id, created_at)
+    SELECT $1, n, 'seed-' || n::text, 'warning', $4, $5, 'Saved warning reason ' || n::text,
+      'Maru Development', $6, TIMESTAMPTZ '2026-10-26 00:00:00+00' + n * INTERVAL '1 second'
+    FROM generate_series($2::int, $3::int) AS n`, [selectedGuild, start, start + count - 1, user, target, channelId]);
+}
+function caseLinks(html: string): number[] {
+  return [...html.matchAll(/href="\/cases\/(\d+)">Case #/g)].map((match) => Number(match[1]));
+}
+async function history(path: string, session: string) {
+  return request(path, { headers: { cookie: session } });
+}
+
+test('history and case detail require authentication', async () => {
+  await seedCases();
+  for (const path of ['/cases', '/cases/1']) {
+    assert.equal((await request(path)).status, 303);
+    assert.equal((await request(path, { method: 'POST' })).status, 405);
+  }
+});
+test('Admin and ordinary Mod can read case history and detail', async () => {
+  await seedCases(); const session = await signIn();
+  for (const actorRoles of [[adminRole], [modRole]]) {
+    roles = actorRoles;
+    const list = await history('/cases', session); assert.equal(list.status, 200);
+    assert.deepEqual(caseLinks(await list.text()), [1]);
+    const detail = await history('/cases/1', session); assert.equal(detail.status, 200);
+    assert.match(await detail.text(), /Saved warning reason 1/);
+  }
+});
+test('lost staff roles invalidate the session before exposing case data', async () => {
+  await seedCases(); const session = await signIn(); roles = [];
+  const response = await history('/cases/1', session); assert.equal(response.status, 403);
+  assert.ok(!(await response.text()).includes('Saved warning reason'));
+});
+test('expired sessions cannot read case history', async () => {
+  await seedCases(); const session = await signIn();
+  await db.exec("UPDATE dashboard_sessions SET expires_at = NOW() - INTERVAL '1 minute'");
+  assert.equal((await history('/cases', session)).status, 303);
+});
+test('membership lookup failure cannot expose case history', async () => {
+  await seedCases(); const session = await signIn(); memberFailure = true;
+  const response = await history('/cases', session); assert.equal(response.status, 503);
+  assert.ok(!(await response.text()).includes('Saved warning reason'));
+});
+test('revoking full access still permits ordinary Mod case viewing', async () => {
+  await seedCases(); roles = [modRole];
+  await pool.query('INSERT INTO staff_access_grants (guild_id, user_id, granted_by) VALUES ($1,$2,$3)', [guild, user, user]);
+  const session = await signIn(); await pool.query('DELETE FROM staff_access_grants WHERE guild_id=$1', [guild]);
+  assert.equal((await history('/cases/1', session)).status, 200);
+});
+test('case list is newest first and paginates without duplicates or skips', async () => {
+  await seedCases(45); const session = await signIn();
+  const first = await (await history('/cases', session)).text();
+  assert.deepEqual(caseLinks(first), Array.from({ length: 20 }, (_, i) => 45 - i));
+  assert.match(first, /href="\/cases\?before=26"/);
+  const second = await (await history('/cases?before=26', session)).text();
+  assert.deepEqual(caseLinks(second), Array.from({ length: 20 }, (_, i) => 25 - i));
+  assert.match(second, /Newest cases/); assert.match(second, /href="\/cases\?before=6"/);
+  const third = await (await history('/cases?before=6', session)).text();
+  assert.deepEqual(caseLinks(third), [5, 4, 3, 2, 1]); assert.ok(!third.includes('Older cases →'));
+});
+test('a new warning cannot shift an already opened older-page cursor', async () => {
+  await seedCases(25); const session = await signIn();
+  const first = await (await history('/cases', session)).text(); assert.equal(caseLinks(first).at(-1), 6);
+  await seedCases(1, guild, 26);
+  const older = await (await history('/cases?before=6', session)).text();
+  assert.deepEqual(caseLinks(older), [5, 4, 3, 2, 1]);
+});
+test('filtering by saved member ID works without current Discord membership', async () => {
+  const formerMember = '800000000000000099';
+  await seedCases(21, guild, 1, formerMember); await seedCases(1, guild, 22, '800000000000000098');
+  const session = await signIn();
+  const first = await (await history(`/cases?member=${formerMember}`, session)).text();
+  assert.deepEqual(caseLinks(first), Array.from({ length: 20 }, (_, i) => 21 - i));
+  assert.ok(first.includes(`member=${formerMember}&amp;before=2`));
+  const older = await (await history(`/cases?member=${formerMember}&before=2`, session)).text();
+  assert.deepEqual(caseLinks(older), [1]); assert.ok(older.includes(`href="/cases?member=${formerMember}">Newest cases`));
+});
+test('empty list, empty member history, and exhausted cursor have clear messages', async () => {
+  const session = await signIn();
+  assert.match(await (await history('/cases', session)).text(), /No moderation cases recorded yet/);
+  assert.match(await (await history('/cases?member=800000000000000099', session)).text(), /No cases found for this member/);
+  assert.match(await (await history('/cases?before=1', session)).text(), /No older cases found/);
+});
+test('empty member filter clears the filter and pasted surrounding spaces are trimmed', async () => {
+  await seedCases(); const session = await signIn();
+  assert.deepEqual(caseLinks(await (await history('/cases?member=', session)).text()), [1]);
+  assert.deepEqual(caseLinks(await (await history('/cases?member=%20800000000000000001%20', session)).text()), [1]);
+});
+test('malformed filters and ambiguous duplicate parameters are rejected', async () => {
+  await seedCases(); const session = await signIn();
+  const paths = ['/cases?member=abc', '/cases?member=1', '/cases?member=1%27%20OR%201%3D1',
+    '/cases?before=-1', '/cases?before=0', '/cases?before=01', '/cases?before=1.5', '/cases?before=2147483648',
+    '/cases?before=', '/cases?before=2&before=3', '/cases?member=&member=', '/cases?guild=100000000000000002'];
+  for (const path of paths) {
+    const response = await history(path, session); assert.equal(response.status, 400, path);
+    assert.ok(!(await response.text()).includes('Saved warning reason'));
+  }
+});
+test('case numbers are validated and missing cases return a private 404', async () => {
+  await seedCases(); const session = await signIn();
+  for (const number of ['0', '-1', '01', '1.5', '2147483648', 'abc']) {
+    assert.equal((await history(`/cases/${number}`, session)).status, 400);
+  }
+  const response = await history('/cases/99', session); assert.equal(response.status, 404);
+  assert.match(await response.text(), /No case with that number exists in this server/);
+});
+test('history and detail cannot expose cases belonging to another server', async () => {
+  const otherGuild = '100000000000000002';
+  await pool.query('INSERT INTO guild_settings (guild_id) VALUES ($1)', [otherGuild]);
+  await seedCases(1); await seedCases(1, otherGuild, 2);
+  await pool.query('UPDATE moderation_cases SET reason=$2 WHERE guild_id=$1', [otherGuild, 'OTHER_SERVER_PRIVATE_CASE']);
+  const session = await signIn();
+  const list = await (await history('/cases', session)).text();
+  assert.deepEqual(caseLinks(list), [1]); assert.ok(!list.includes('OTHER_SERVER_PRIVATE_CASE'));
+  assert.equal((await history('/cases/2', session)).status, 404);
+  const detail = await (await history(`/cases/1?guild=${otherGuild}`, session)).text();
+  assert.ok(!detail.includes('OTHER_SERVER_PRIVATE_CASE')); assert.match(detail, /Saved warning reason 1/);
+});
+test('case detail shows complete escaped reason, saved IDs, statuses, and UTC time', async () => {
+  await seedCases();
+  await pool.query(`UPDATE moderation_cases SET reason=$2, guild_name=$3, dm_status='failed',
+    log_status='sent', log_message_id=$4 WHERE guild_id=$1`, [guild, '<script>alert(1)</script>\nSecond line',
+    '<img src=x onerror=alert(1)>', messageId]);
+  const session = await signIn(); const response = await history('/cases/1', session);
+  assert.equal(response.status, 200); const html = await response.text();
+  assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;\nSecond line'));
+  assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'));
+  assert.ok(!html.includes('<script>alert(1)'));
+  assert.match(html, /Failed/); assert.match(html, /Sent/); assert.match(html, /2026-10-26 00:00:01 UTC/);
+  assert.ok(html.includes(messageId)); assert.ok(html.includes(channelId));
+  assert.match(html, /not that the member read it/);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+});
+test('uncertain, pending, and unconfigured delivery statuses are accurately labelled', async () => {
+  await seedCases(); const session = await signIn();
+  for (const [dm, log, labels] of [
+    ['pending', 'not_configured', ['Not attempted', 'No log channel configured']],
+    ['sending', 'unconfirmed', ['Not confirmed (attempt started)', 'Not confirmed']],
+  ] as const) {
+    await pool.query('UPDATE moderation_cases SET dm_status=$2,log_status=$3 WHERE guild_id=$1', [guild, dm, log]);
+    const body = await (await history('/cases/1', session)).text();
+    for (const label of labels) assert.ok(body.includes(label));
+  }
+});
+test('viewing cases never changes records or repeats messages', async () => {
+  await seedCases(); const session = await signIn();
+  const before = await db.query('SELECT * FROM moderation_cases ORDER BY case_number');
+  for (const path of ['/cases', '/cases/1', '/cases/1', '/cases?member=800000000000000001']) {
+    assert.equal((await history(path, session)).status, 200);
+  }
+  const after = await db.query('SELECT * FROM moderation_cases ORDER BY case_number');
+  assert.deepEqual(after.rows, before.rows); assert.equal(sends.length, 0);
+  assert.equal((await db.query('SELECT * FROM audit_events')).rows.length, 0);
+});
+test('overview links audit case numbers to the protected detail page', async () => {
+  await seedCases();
+  await pool.query(`INSERT INTO audit_events (guild_id, actor_id, event_type, details)
+    VALUES ($1,$2,'WARNING_CREATED','{"case_number":1}'::jsonb)`, [guild, user]);
+  const session = await signIn(); const html = await (await history('/dashboard', session)).text();
+  assert.ok(html.includes('href="/cases/1">Case #1'));
+  assert.ok(html.includes('href="/cases">Moderation cases'));
 });
