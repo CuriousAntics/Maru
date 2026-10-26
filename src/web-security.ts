@@ -63,3 +63,7 @@ export function escapeHtml(value: unknown): string {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   })[char]!);
 }
+
+export function starboardProof(token: string, boardId: string, revision: number, action: 'create' | 'save'): string {
+  return createHmac('sha256', token).update(`maru-starboard:${boardId}:${revision}:${action}`).digest('base64url');
+}
