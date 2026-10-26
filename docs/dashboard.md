@@ -56,3 +56,7 @@ Live checks after deployment:
 Production callback URL: never share screenshots or browser URLs containing an OAuth `code`. Share only the final dashboard or the generic error page.
 
 Reference: https://docs.discord.com/developers/topics/oauth2
+
+## Starboard configuration
+
+The Starboard navigation item opens the multiple-board settings page for configured Admins and Mods. See [starboard-settings.md](starboard-settings.md) for fields, permissions, audit behavior and deployment steps. This increment saves configuration; reaction posting is not active yet.

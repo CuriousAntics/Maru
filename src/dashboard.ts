@@ -12,6 +12,8 @@ import { sendTestLog } from './test-log.js';
 import type { SendTestMessage } from './test-log.js';
 import { logChannelId, saveLogChannel, SettingsError } from './server-settings.js';
 import type { LogChannel } from './server-settings.js';
+import { handleStarboardPage } from './starboard-web.js';
+import type { StarboardResources } from './starboard-settings.js';
 import type { AuditRow } from './web-pages.js';
 
 type Session = { user_id: string; display_name: string };
@@ -23,6 +25,7 @@ type Options = {
   readMemberRoles: (userId: string) => Promise<string[] | null>;
   readLogChannels?: () => Promise<LogChannel[]>;
   sendTestMessage?: SendTestMessage;
+  readStarboardResources?: () => Promise<StarboardResources>;
   fetcher?: typeof fetch;
 };
 
@@ -70,9 +73,11 @@ export function createDashboardHandler(options: Options) {
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
     const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases'];
+    const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save))?)?$/.test(path);
+    const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save)$/.test(path);
     const caseDetail = /^\/cases\/([^/]+)$/.exec(path);
     const caseMutation = /^\/cases\/([^/]+)\/(correct|void)$/.exec(path);
-    if (!routes.includes(path) && !caseDetail && !caseMutation) {
+    if (!routes.includes(path) && !caseDetail && !caseMutation && !starboardPath) {
       message(response, 404, 'Page not found', 'This page is not available.');
       return;
     }
@@ -80,7 +85,7 @@ export function createDashboardHandler(options: Options) {
       message(response, 503, 'Dashboard setup pending', 'Dashboard sign-in has not been configured yet.');
       return;
     }
-    const expectedMethod = (caseMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : path === '/settings' ? 'GET, POST' : 'GET';
+    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : path === '/settings' ? 'GET, POST' : 'GET';
     if (!expectedMethod.split(', ').includes(request.method ?? '')) {
       response.setHeader('Allow', expectedMethod);
       message(response, 405, 'Method not allowed', 'Use the dashboard controls to continue.');
@@ -253,6 +258,15 @@ export function createDashboardHandler(options: Options) {
       await pool.query('DELETE FROM dashboard_sessions WHERE token_hash = $1', [digest(sessionToken)]);
       response.setHeader('Set-Cookie', cookie(sessionName, '', 0, config.secure));
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
+      return;
+    }
+    if (starboardPath) {
+      if (!options.readStarboardResources) throw new Error('STARBOARD_RESOURCES_UNAVAILABLE');
+      await handleStarboardPage(request,path,{ pool,guildId,actorId: session.user_id,sessionToken,origin: config.origin,
+        readMemberRoles,readResources: options.readStarboardResources },{
+        html: (status,render) => html(response,status,render),message: (status,title,text) => message(response,status,title,text),
+        redirect: (location) => redirect(response,location),
+      });
       return;
     }
     if (caseMutation) {

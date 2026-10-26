@@ -10,6 +10,7 @@ import { handleTimeout } from './handle-timeout.js';
 import { timeoutDependencies } from './timeout-discord.js';
 import { handleWarning } from './handle-warning.js';
 import { warningDependencies } from './warning-discord.js';
+import { starboardResources } from './starboard-discord.js';
 import { createDashboardHandler } from './dashboard.js';
 import { dashboardConfig } from './web-security.js';
 import { Routes } from 'discord.js';
@@ -58,6 +59,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    readStarboardResources: starboardResources(client, guildId),
     readMemberRoles: async (userId) => {
       try {
         const member = await client.rest.get(Routes.guildMember(guildId, userId)) as RESTGetAPIGuildMemberResult;
