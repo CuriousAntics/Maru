@@ -289,7 +289,7 @@ export function createDashboardHandler(options: Options) {
       } catch (error) {
         if (!(error instanceof CaseChangeError) && !(error instanceof CaseHistoryError)) throw error;
         const messages: Record<string, [number, string]> = {
-          ACTION_READ_ONLY: [409, 'Timeout cases are read only. Use /untimeout to remove an active Discord timeout.'],
+          ACTION_READ_ONLY: [409, 'Discord action cases are read only. Use /untimeout or /unban for the corresponding Discord action.'],
           ACCESS_DENIED: [403, 'Mods may change only warnings they issued. Admins and Mods with full access may change any warning.'],
           SESSION_EXPIRED: [403, 'Your session expired. Sign in again before changing this case.'],
           CASE_NOT_FOUND: [404, 'No case with that number exists in this server.'],

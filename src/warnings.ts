@@ -11,7 +11,7 @@ export class WarningError extends Error {
 }
 export type DeliveryStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'unconfirmed' | 'not_configured' | 'skipped';
 export type WarningCase = {
-  guild_id: string; case_number: number; request_id: string; action: 'warning' | 'timeout' | 'untimeout';
+  guild_id: string; case_number: number; request_id: string; action: 'warning' | 'timeout' | 'untimeout' | 'ban' | 'unban';
   actor_id: string; target_user_id: string; reason: string; guild_name: string;
   log_channel_id: string | null; dm_status: DeliveryStatus; log_status: DeliveryStatus;
   dm_message_id: string | null; log_message_id: string | null; created_at: Date;
@@ -20,7 +20,7 @@ export type WarningCase = {
   action_status: 'not_applicable' | 'pending' | 'applying' | 'applied' | 'rejected' | 'unconfirmed';
   duration_seconds: number | null; requested_until: Date | null; previous_until: Date | null;
   action_attempted_at: Date | null; action_completed_at: Date | null; action_error: string | null;
-  notification_claimed_at: Date | null;
+  notification_claimed_at: Date | null; delete_message_seconds: number | null;
 };
 export type WarningContext = {
   actorRoleIds: string[]; targetRoleIds: string[];
@@ -128,13 +128,14 @@ export function warningMessage(record: WarningCase, kind: 'dm' | 'log'): RESTPos
   };
 }
 
-// Claim both deliveries once. A restart or duplicate interaction never silently repeats a DM/log.
+// Claim final notifications once; ban DMs were already attempted before the action.
+// A restart or duplicate interaction never silently repeats a DM/log.
 export async function deliverWarning(pool: Database, record: WarningCase, deps: WarningDependencies,
   messageBuilder: typeof warningMessage = warningMessage): Promise<WarningCase> {
   const claim = await pool.query<WarningCase>(
     `UPDATE moderation_cases SET notification_claimed_at=NOW(), dm_status = CASE WHEN dm_status='pending' THEN 'sending' ELSE dm_status END,
        log_status = CASE WHEN log_status = 'pending' THEN 'sending' ELSE log_status END
-     WHERE guild_id = $1 AND case_number = $2 AND dm_status IN ('pending','skipped') AND notification_claimed_at IS NULL AND state='active'
+     WHERE guild_id = $1 AND case_number = $2 AND (dm_status IN ('pending','skipped') OR (action='ban' AND dm_status IN ('sent','failed','unconfirmed'))) AND notification_claimed_at IS NULL AND state='active'
        AND (action='warning' OR action_status IN ('applied','rejected','unconfirmed')) RETURNING *`,
     [record.guild_id, record.case_number]);
   if (!claim.rows[0]) {
@@ -145,7 +146,7 @@ export async function deliverWarning(pool: Database, record: WarningCase, deps: 
   }
   record = claim.rows[0];
   async function deliver(kind: 'dm' | 'log'): Promise<void> {
-    if ((kind === 'log' && !record.log_channel_id) || (kind === 'dm' && record.dm_status === 'skipped')) return;
+    if ((kind === 'log' && !record.log_channel_id) || (kind === 'dm' && (record.dm_status === 'skipped' || record.action === 'ban' || record.action === 'unban'))) return;
     let status: 'sent' | 'failed' | 'unconfirmed' = 'unconfirmed';
     let messageId: string | null = null;
     try {

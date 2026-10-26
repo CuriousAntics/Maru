@@ -84,7 +84,7 @@ async function read(number: number, selectedGuild = guild) {
 }
 
 before(async () => {
-  for (const name of ['001_foundation.sql', '003_moderation_warnings.sql', '004_case_changes.sql', '005_timeouts.sql']) {
+  for (const name of ['001_foundation.sql', '003_moderation_warnings.sql', '004_case_changes.sql', '005_timeouts.sql', '006_bans.sql']) {
     await db.exec((await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8')).replace(/^\uFEFF/, ''));
   }
 });
@@ -422,5 +422,15 @@ test('case-change migration preserves legacy cases, accepts old inserts, and gua
     const delivered = (await legacy.query<{ notification_claimed_at: Date | null }>(
       'SELECT notification_claimed_at FROM moderation_cases WHERE case_number=1')).rows[0]!;
     assert.ok(delivered.notification_claimed_at);
+    await legacy.query(`INSERT INTO moderation_cases
+      (guild_id,case_number,request_id,action,actor_id,target_user_id,reason,guild_name,action_status,duration_seconds,requested_until)
+      VALUES ($1,4,'old-timeout','timeout',$2,$3,'Existing timeout','Legacy server','applied',60,NOW()+INTERVAL '1 minute')`,[guild,actor,target]);
+    await legacy.exec(await readFile(new URL('../migrations/006_bans.sql',import.meta.url),'utf8'));
+    await legacy.query(oldInsert,[guild,5,'old-warning-after-bans',actor,target,'Legacy warning after ban migration']);
+    const compatible = (await legacy.query<{ action: string; action_status: string; delete_message_seconds: number | null }>(
+      'SELECT action,action_status,delete_message_seconds FROM moderation_cases WHERE case_number IN (4,5) ORDER BY case_number')).rows;
+    assert.deepEqual(compatible,[{ action: 'timeout',action_status: 'applied',delete_message_seconds: null },
+      { action: 'warning',action_status: 'not_applicable',delete_message_seconds: null }]);
+
   } finally { await legacy.close(); }
 });

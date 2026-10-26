@@ -1,5 +1,5 @@
 export function actionLabel(action: string): string {
-  return ({ warning: 'Warning', timeout: 'Timeout', untimeout: 'Timeout removal' } as Record<string,string>)[action] ?? 'Moderation action';
+  return ({ warning: 'Warning', timeout: 'Timeout', untimeout: 'Timeout removal', ban: 'Ban', unban: 'Unban' } as Record<string,string>)[action] ?? 'Moderation action';
 }
 export function actionResultLabel(status: string): string {
   return ({ not_applicable: 'Not applicable', pending: 'Not attempted', applying: 'Not confirmed (attempt started)',

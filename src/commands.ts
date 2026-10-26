@@ -52,3 +52,17 @@ export const untimeout = new SlashCommandBuilder().setName('untimeout')
   .addUserOption((option) => option.setName('member').setDescription('Member whose timeout should be removed').setRequired(true))
   .addStringOption((option) => option.setName('reason').setDescription('Why the timeout should be removed')
     .setMinLength(1).setMaxLength(500).setRequired(true));
+
+export const ban = new SlashCommandBuilder().setName('ban')
+  .setDescription('Ban a current member; DM first and delete 24h of messages by default.')
+  .addUserOption((option) => option.setName('member').setDescription('Current server member to ban').setRequired(true))
+  .addStringOption((option) => option.setName('reason').setDescription('Why this ban is being issued')
+    .setMinLength(1).setMaxLength(500).setRequired(true))
+  .addStringOption((option) => option.setName('delete-history').setDescription('Default 24h; use 0 to keep messages or a duration up to 7d')
+    .setMinLength(1).setMaxLength(32));
+export const unban = new SlashCommandBuilder().setName('unban')
+  .setDescription('Remove a user ban by ID and record the action; does not restore messages.')
+  .addStringOption((option) => option.setName('user-id').setDescription('Discord user ID of the banned user')
+    .setMinLength(17).setMaxLength(20).setRequired(true))
+  .addStringOption((option) => option.setName('reason').setDescription('Why the ban should be removed')
+    .setMinLength(1).setMaxLength(500).setRequired(true));
