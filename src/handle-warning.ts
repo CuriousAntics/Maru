@@ -23,7 +23,7 @@ export function deliveryLabel(status: DeliveryStatus): string {
     failed: 'Failed', unconfirmed: 'Not confirmed', not_configured: 'No log channel configured' })[status];
 }
 export function caseSummary(record: WarningCase): string {
-  return `Case #${record.case_number} · Warning\nMember ID: ${record.target_user_id}\nStaff ID: ${record.actor_id}\n` +
+  return `Case #${record.case_number} · Warning · ${record.state === 'void' ? 'Voided' : 'Active'}\nMember ID: ${record.target_user_id}\nStaff ID: ${record.actor_id}\n` +
     `Reason: ${escapeMarkdown(record.reason)}\nCreated: ${new Date(record.created_at).toISOString()}\n` +
     `DM: ${deliveryLabel(record.dm_status)}\nModeration log: ${deliveryLabel(record.log_status)}`;
 }

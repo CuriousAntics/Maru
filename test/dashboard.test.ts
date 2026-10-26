@@ -7,7 +7,7 @@ import { PGlite } from '@electric-sql/pglite';
 import type { Pool } from 'pg';
 import type { RESTPostAPIChannelMessageJSONBody } from 'discord.js';
 import { createDashboardHandler } from '../src/dashboard.js';
-import { cookie, dashboardConfig, digest, logoutProof, settingsProof, testLogProof, randomToken } from '../src/web-security.js';
+import { caseChangeProof, cookie, dashboardConfig, digest, logoutProof, settingsProof, testLogProof, randomToken } from '../src/web-security.js';
 
 const db = new PGlite();
 const guild = '100000000000000001';
@@ -16,10 +16,12 @@ const adminRole = '200000000000000001';
 const modRole = '200000000000000002';
 let failSettingsAudit = false;
 let failTestAudit: 'request' | 'result' | undefined;
+let failCaseAudit = false;
 async function query(sql: string, values?: unknown[]) {
   if (failSettingsAudit && sql.includes("'SERVER_SETTINGS_CHANGED'")) throw new Error('test audit write failure');
   if (failTestAudit === 'request' && sql.includes("'TEST_LOG_REQUESTED',")) throw new Error('test request audit failure');
   if (failTestAudit === 'result' && values?.[2] && String(values[2]).startsWith('TEST_LOG_')) throw new Error('test result audit failure');
+  if (failCaseAudit && ['CASE_REASON_CORRECTED', 'CASE_VOIDED'].includes(String(values?.[2]))) throw new Error('audit failed');
   const result = await db.query(sql, values);
   return { rows: result.rows, rowCount: result.rows.length || result.affectedRows || 0 };
 }
@@ -73,7 +75,7 @@ let handler: ReturnType<typeof makeHandler>;
 const server = createServer((request, response) => { void handler(request, response); });
 
 before(async () => {
-  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql', '003_moderation_warnings.sql']) {
+  for (const name of ['001_foundation.sql', '002_dashboard_auth.sql', '003_moderation_warnings.sql', '004_case_changes.sql']) {
     const sql = await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
     await db.exec(sql.replace(/^\uFEFF/, ''));
   }
@@ -82,7 +84,7 @@ before(async () => {
 });
 beforeEach(async () => {
   failSettingsAudit = false; channelFailure = false; memberReadHook = undefined;
-  failTestAudit = undefined; sendFailure = undefined; sends = []; botReady = true;
+  failCaseAudit = false; failTestAudit = undefined; sendFailure = undefined; sends = []; botReady = true;
   channels = [{ id: channelId, name: 'logs', usable: true }, { id: secondChannel, name: 'staff-logs', usable: true }];
   roles = [adminRole]; memberFailure = false; exchangeFailure = false; exchanges = 0; displayName = 'Miranda';
   await db.exec('TRUNCATE moderation_cases, guild_case_counters, dashboard_login_attempts, dashboard_sessions, audit_events, staff_access_grants, staff_roles, guild_settings RESTART IDENTITY');
@@ -699,9 +701,9 @@ test('revoking a full-access grant during test authorization prevents delivery',
 
 async function seedCases(count = 1, selectedGuild = guild, start = 1, target = '800000000000000001') {
   await pool.query(`INSERT INTO moderation_cases (guild_id, case_number, request_id, action, actor_id,
-    target_user_id, reason, guild_name, log_channel_id, created_at)
+    target_user_id, reason, guild_name, log_channel_id, created_at, original_reason)
     SELECT $1, n, 'seed-' || n::text, 'warning', $4, $5, 'Saved warning reason ' || n::text,
-      'Maru Development', $6, TIMESTAMPTZ '2026-10-26 00:00:00+00' + n * INTERVAL '1 second'
+      'Maru Development', $6, TIMESTAMPTZ '2026-10-26 00:00:00+00' + n * INTERVAL '1 second', 'Saved warning reason ' || n::text
     FROM generate_series($2::int, $3::int) AS n`, [selectedGuild, start, start + count - 1, user, target, channelId]);
 }
 function caseLinks(html: string): number[] {
@@ -861,4 +863,162 @@ test('overview links audit case numbers to the protected detail page', async () 
   const session = await signIn(); const html = await (await history('/dashboard', session)).text();
   assert.ok(html.includes('href="/cases/1">Case #1'));
   assert.ok(html.includes('href="/cases">Moderation cases'));
+});
+
+async function caseForm(session: string, number = 1, action: 'correct' | 'void' = 'correct') {
+  const response = await history(`/cases/${number}`, session);
+  const html = await response.text();
+  const form = html.match(new RegExp(`<form method="post" action="/cases/${number}/${action}">([\\s\\S]*?)</form>`))?.[1];
+  assert.ok(form, 'case change form exists');
+  const fields: Record<string, string> = {};
+  for (const match of form.matchAll(/name="([^"]+)" value="([^"]*)"/g)) fields[match[1]!] = match[2]!;
+  fields.reason = 'Correcting a development test case';
+  if (action === 'correct') fields.new_reason = 'Corrected warning reason';
+  else fields.confirm = String(number);
+  return fields;
+}
+async function postCase(session: string, fields: Record<string, string>, action = 'correct', number = 1, headers: Record<string, string> = {}) {
+  return request(`/cases/${number}/${action}`, { method: 'POST', headers: {
+    cookie: session, origin: base, 'Content-Type': 'application/x-www-form-urlencoded', ...headers,
+  }, body: new URLSearchParams(fields) });
+}
+async function caseRecord(number = 1) {
+  return (await db.query<Record<string, unknown>>('SELECT * FROM moderation_cases WHERE guild_id=$1 AND case_number=$2', [guild, number])).rows[0]!;
+}
+async function changes() {
+  return (await db.query<{ actor_id: string; event_type: string; details: Record<string, unknown> }>(
+    "SELECT actor_id,event_type,details FROM audit_events WHERE event_type IN ('CASE_REASON_CORRECTED','CASE_VOIDED') ORDER BY event_id")).rows;
+}
+test('Admin corrects a case while retaining its original reason and author', async () => {
+  await seedCases(); const session = await signIn(); const fields = await caseForm(session);
+  assert.equal((await postCase(session, fields)).status, 303);
+  const record = await caseRecord();
+  assert.equal(record.reason, 'Corrected warning reason'); assert.equal(record.original_reason, 'Saved warning reason 1');
+  assert.equal(record.actor_id, user); assert.equal(record.revision, 1); assert.equal(record.last_changed_by, user);
+  const audit = await changes(); assert.equal(audit.length, 1); assert.equal(audit[0]!.actor_id, user);
+  assert.equal(audit[0]!.details.before_reason, 'Saved warning reason 1'); assert.equal(audit[0]!.details.after_reason, fields.new_reason);
+  const html = await (await history('/cases/1', session)).text();
+  assert.match(html, /Original reason/); assert.match(html, /Reason corrected/);
+});
+test('ordinary Mod can change and void only their own cases', async () => {
+  await seedCases(2); await pool.query('UPDATE moderation_cases SET actor_id=$2 WHERE guild_id=$1 AND case_number=2', [guild, '300000000000000099']);
+  const session = await signIn(); const othersForm = await caseForm(session, 2);
+  roles = [modRole];
+  assert.equal((await postCase(session, await caseForm(session))).status, 303);
+  assert.equal((await postCase(session, await caseForm(session, 1, 'void'), 'void')).status, 303);
+  assert.equal((await postCase(session, othersForm, 'correct', 2)).status, 403);
+  const html = await (await history('/cases/2', session)).text();
+  assert.ok(!html.includes('action="/cases/2/correct"')); assert.ok(!html.includes('action="/cases/2/void"'));
+});
+test('full-access Mod can change another author’s case but grant revocation blocks them', async () => {
+  await seedCases(); await pool.query('UPDATE moderation_cases SET actor_id=$2 WHERE guild_id=$1', [guild, '300000000000000099']);
+  roles = [modRole]; await pool.query('INSERT INTO staff_access_grants (guild_id,user_id,granted_by) VALUES ($1,$2,$3)', [guild, user, user]);
+  const session = await signIn(); assert.equal((await postCase(session, await caseForm(session))).status, 303);
+  const form = await caseForm(session, 1, 'void'); await pool.query('DELETE FROM staff_access_grants WHERE guild_id=$1', [guild]);
+  assert.equal((await postCase(session, form, 'void')).status, 403); assert.equal((await caseRecord()).state, 'active');
+});
+test('case correction and voiding require authenticated same-origin POSTs', async () => {
+  await seedCases(); const session = await signIn(); const form = await caseForm(session);
+  assert.equal((await request('/cases/1/correct')).status, 405);
+  assert.equal((await request('/cases/1/void')).status, 405);
+  assert.equal((await postCase('', form)).status, 303);
+  for (const origin of ['null', 'https://invalid.example', '']) {
+    assert.equal((await postCase(session, form, 'correct', 1, { origin })).status, 403);
+  }
+  assert.equal((await postCase(session, form, 'correct', 1, { 'Content-Type': 'text/plain' })).status, 403);
+  assert.equal((await changes()).length, 0);
+});
+test('case form proofs are bound to action, revision and case number', async () => {
+  await seedCases(2); const session = await signIn(); const form = await caseForm(session);
+  assert.equal((await postCase(session, { ...form, csrf: settingsProof(session.split('=')[1]!) })).status, 403);
+  assert.equal((await postCase(session, { ...form, revision: '1' })).status, 403);
+  assert.equal((await postCase(session, form, 'correct', 2)).status, 403);
+  const { new_reason, ...voidForm } = form;
+  assert.equal((await postCase(session, { ...voidForm, confirm: '1' }, 'void')).status, 403);
+  assert.equal((await changes()).length, 0);
+});
+test('stale forms and repeated submissions cannot overwrite or duplicate a correction', async () => {
+  await seedCases(); const session = await signIn(); const form = await caseForm(session);
+  assert.equal((await postCase(session, form)).status, 303);
+  assert.equal((await postCase(session, { ...form, new_reason: 'Stale edit' })).status, 409);
+  assert.equal((await postCase(session, form)).status, 409);
+  assert.equal((await caseRecord()).reason, 'Corrected warning reason'); assert.equal((await changes()).length, 1);
+});
+test('successive corrections retain the original reason and complete before/after audit chain', async () => {
+  await seedCases(); const session = await signIn();
+  await postCase(session, await caseForm(session));
+  await postCase(session, { ...await caseForm(session), new_reason: 'Second corrected reason' });
+  const record = await caseRecord(); const audit = await changes();
+  assert.equal(record.original_reason, 'Saved warning reason 1'); assert.equal(record.reason, 'Second corrected reason');
+  assert.equal(record.revision, 2); assert.equal(audit[1]!.details.before_reason, audit[0]!.details.after_reason);
+});
+test('void requires explicit case-number confirmation and keeps the case visible', async () => {
+  await seedCases(); const session = await signIn(); const form = await caseForm(session, 1, 'void');
+  assert.equal((await postCase(session, { ...form, confirm: '2' }, 'void')).status, 400);
+  assert.equal((await postCase(session, form, 'void')).status, 303);
+  const record = await caseRecord(); assert.equal(record.state, 'void'); assert.equal(record.void_reason, form.reason);
+  assert.equal(record.original_reason, 'Saved warning reason 1'); assert.equal(record.reason, record.original_reason);
+  const html = await (await history('/cases/1', session)).text();
+  assert.match(html, /Voided/); assert.match(html, /Warning voided/); assert.ok(!html.includes('Save correction'));
+  assert.match(await (await history('/cases', session)).text(), /Voided/);
+});
+test('voided cases cannot be corrected or re-voided through crafted forms', async () => {
+  await seedCases(); const session = await signIn();
+  await postCase(session, await caseForm(session, 1, 'void'), 'void');
+  const token = session.split('=')[1]!;
+  assert.equal((await postCase(session, { csrf: caseChangeProof(token, 1, 1, 'correct'), revision: '1',
+    reason: 'Change after void', new_reason: 'Overwritten' })).status, 409);
+  assert.equal((await postCase(session, { csrf: caseChangeProof(token, 1, 1, 'void'), revision: '1',
+    reason: 'Void again', confirm: '1' }, 'void')).status, 409);
+  assert.equal((await changes()).length, 1);
+});
+test('audit failure rolls back a correction and void completely', async () => {
+  await seedCases(); const session = await signIn(); const before = await caseRecord();
+  failCaseAudit = true;
+  assert.equal((await postCase(session, await caseForm(session))).status, 503);
+  assert.deepEqual(await caseRecord(), before);
+  assert.equal((await postCase(session, await caseForm(session, 1, 'void'), 'void')).status, 503);
+  assert.deepEqual(await caseRecord(), before); assert.equal((await changes()).length, 0);
+});
+test('case changes reject empty or overlong text and malformed fields', async () => {
+  await seedCases(); const session = await signIn(); const form = await caseForm(session);
+  for (const override of [{ reason: ' ' }, { new_reason: ' ' }, { new_reason: 'x'.repeat(501) }, { reason: 'x'.repeat(501) }]) {
+    assert.equal((await postCase(session, { ...form, ...override })).status, 400);
+  }
+  assert.equal((await postCase(session, { ...form, extra: 'bad' })).status, 400);
+  assert.equal((await postCase(session, { ...form, new_reason: 'x'.repeat(17000) })).status, 413);
+  assert.equal((await changes()).length, 0);
+});
+test('maximum valid Unicode reasons fit the bounded form body', async () => {
+  await seedCases(); const session = await signIn();
+  assert.equal((await postCase(session, { ...await caseForm(session), new_reason: '界'.repeat(500), reason: '改'.repeat(500) })).status, 303);
+});
+test('no-op correction does not create an audit event or increment revision', async () => {
+  await seedCases(); const session = await signIn();
+  assert.equal((await postCase(session, { ...await caseForm(session), new_reason: 'Saved warning reason 1' })).status, 303);
+  assert.equal((await caseRecord()).revision, 0); assert.equal((await changes()).length, 0);
+});
+test('lost staff roles and expired sessions cannot modify an open case form', async () => {
+  await seedCases(); const session = await signIn(); const form = await caseForm(session); roles = [];
+  assert.equal((await postCase(session, form)).status, 403);
+  roles = [adminRole]; const secondSession = await signIn(); const secondForm = await caseForm(secondSession);
+  await db.exec("UPDATE dashboard_sessions SET expires_at=NOW()-INTERVAL '1 minute'");
+  assert.equal((await postCase(secondSession, secondForm)).status, 303); assert.equal((await changes()).length, 0);
+});
+test('authorization is checked again inside the mutation transaction', async () => {
+  await seedCases(); await pool.query('UPDATE moderation_cases SET actor_id=$2 WHERE guild_id=$1', [guild, '300000000000000099']);
+  const session = await signIn(); const form = await caseForm(session); let reads = 0;
+  memberReadHook = async () => { if (++reads === 2) roles = [modRole]; };
+  assert.equal((await postCase(session, form)).status, 403); assert.equal((await changes()).length, 0);
+});
+test('case edits are server-scoped and escaped history does not send notifications', async () => {
+  await seedCases(); const otherGuild = '100000000000000002';
+  await pool.query('INSERT INTO guild_settings (guild_id) VALUES ($1)', [otherGuild]); await seedCases(1, otherGuild);
+  const session = await signIn(); const form = await caseForm(session);
+  await postCase(session, { ...form, new_reason: '<script>new</script>', reason: '<img src=x onerror=alert(1)>' });
+  const other = await db.query<{ reason: string }>('SELECT reason FROM moderation_cases WHERE guild_id=$1', [otherGuild]);
+  assert.equal(other.rows[0]!.reason, 'Saved warning reason 1');
+  const html = await (await history('/cases/1', session)).text();
+  assert.ok(html.includes('&lt;script&gt;new&lt;/script&gt;')); assert.ok(!html.includes('<script>new'));
+  assert.ok(html.includes('&lt;img')); assert.equal(sends.length, 0);
 });

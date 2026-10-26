@@ -84,7 +84,7 @@ async function read(number: number, selectedGuild = guild) {
 }
 
 before(async () => {
-  for (const name of ['001_foundation.sql', '003_moderation_warnings.sql']) {
+  for (const name of ['001_foundation.sql', '003_moderation_warnings.sql', '004_case_changes.sql']) {
     await db.exec((await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8')).replace(/^\uFEFF/, ''));
   }
 });
@@ -379,4 +379,39 @@ test('failure replying after a committed warning does not create or deliver it t
   await handleWarning(call, pool, guild, deps);
   assert.match(replies[0]!.content, /Warning #1 is saved/);
   assert.equal(dms.length, 1); assert.equal(logs.length, 1);
+});
+
+test('voiding before delivery is claimed prevents both notifications', async () => {
+  const { record } = await create();
+  await pool.query("UPDATE moderation_cases SET state='void',void_reason='Mistaken test warning' WHERE guild_id=$1", [guild]);
+  const result = await deliverWarning(pool, record, deps);
+  assert.equal(result.state, 'void'); assert.equal(dms.length + logs.length, 0);
+  assert.match(caseSummary(result), /Voided/);
+});
+test('duplicate warning interaction still matches its immutable original reason after correction', async () => {
+  const data = input(); await createWarning(pool, data, deps);
+  await pool.query('UPDATE moderation_cases SET reason=$2 WHERE guild_id=$1', [guild, 'Corrected later']);
+  const result = await createWarning(pool, data, deps);
+  assert.equal(result.created, false); assert.equal(result.record.reason, 'Corrected later');
+  assert.equal(result.record.original_reason, data.reason);
+});
+
+test('case-change migration preserves legacy cases, accepts old inserts, and guards original reasons', async () => {
+  const legacy = new PGlite();
+  try {
+    for (const name of ['001_foundation.sql', '003_moderation_warnings.sql']) {
+      await legacy.exec((await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8')).replace(/^\uFEFF/, ''));
+    }
+    await legacy.query('INSERT INTO guild_settings (guild_id) VALUES ($1)', [guild]);
+    const oldInsert = `INSERT INTO moderation_cases (guild_id,case_number,request_id,action,actor_id,target_user_id,reason,guild_name)
+      VALUES ($1,$2,$3,'warning',$4,$5,$6,'Legacy server')`;
+    await legacy.query(oldInsert, [guild, 1, 'old-request', actor, target, 'Original legacy reason']);
+    await legacy.exec(await readFile(new URL('../migrations/004_case_changes.sql', import.meta.url), 'utf8'));
+    await legacy.query(oldInsert, [guild, 2, 'old-bot-after-migration', actor, target, 'Old bot still works']);
+    const rows = (await legacy.query<{ original_reason: string; state: string; revision: number }>(
+      'SELECT original_reason,state,revision FROM moderation_cases ORDER BY case_number')).rows;
+    assert.deepEqual(rows.map((row) => row.original_reason), ['Original legacy reason', 'Old bot still works']);
+    assert.ok(rows.every((row) => row.state === 'active' && row.revision === 0));
+    await assert.rejects(legacy.exec("UPDATE moderation_cases SET original_reason='Rewritten'"), /ORIGINAL_REASON_IMMUTABLE/);
+  } finally { await legacy.close(); }
 });

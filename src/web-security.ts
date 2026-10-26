@@ -42,6 +42,9 @@ export function settingsProof(token: string): string {
 export function testLogProof(token: string, requestId: string, channelId: string): string {
   return createHmac('sha256', token).update(`maru-test-log:${requestId}:${channelId}`).digest('base64url');
 }
+export function caseChangeProof(token: string, number: number, revision: number, action: 'correct' | 'void'): string {
+  return createHmac('sha256', token).update(`maru-case-change:${number}:${revision}:${action}`).digest('base64url');
+}
 export function cookieName(kind: 'login' | 'session', secure: boolean): string {
   return `${secure ? '__Host-' : ''}maru_${kind}`;
 }

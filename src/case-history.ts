@@ -42,3 +42,16 @@ export async function loadCaseDetail(pool: Pick<Pool, 'query'>, guildId: string,
     'SELECT * FROM moderation_cases WHERE guild_id = $1 AND case_number = $2', [guildId, caseNumber]);
   return result.rows[0];
 }
+
+export type CaseChangeEvent = {
+  event_id: string; actor_id: string; event_type: string;
+  details: Record<string, unknown>; created_at: Date;
+};
+export async function loadCaseChanges(pool: Pick<Pool, 'query'>, guildId: string, caseNumber: number) {
+  const result = await pool.query<CaseChangeEvent>(
+    `SELECT event_id, actor_id, event_type, details, created_at FROM audit_events
+     WHERE guild_id = $1 AND details->>'case_number' = $2
+     AND event_type IN ('CASE_REASON_CORRECTED', 'CASE_VOIDED') ORDER BY event_id DESC LIMIT 50`,
+    [guildId, String(caseNumber)]);
+  return result.rows;
+}
