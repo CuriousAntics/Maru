@@ -340,3 +340,19 @@ test('Discord adapter distinguishes unknown ban from lookup failure and checks n
   mode = 'missing'; assert.equal((await adapter.readBanContext(actor,target,'unban')).isBanned,false);
   permission = false; await assert.rejects(adapter.readBanContext(actor,target,'unban'),/ACTOR_PERMISSION/); assert.equal(lookups,2);
 });
+
+
+test('ban and unban accept the actual REST parser output for a Discord 204 response', async () => {
+  const { parseResponse } = await import('@discordjs/rest');
+  const emptyResponse = async () => parseResponse(new Response(null,{ status: 204 }));
+  const parsed = await emptyResponse();
+  assert.ok(parsed instanceof ArrayBuffer); assert.equal(parsed.byteLength,0);
+  const writer = { put: emptyResponse,delete: emptyResponse } as unknown as Pick<REST,'put'|'delete'|'post'>;
+  const adapter = banDependencies({} as Client,guild,'test-token',deps,writer);
+  await adapter.applyBan(target,0,1,'ban');
+  await adapter.applyBan(target,null,2,'unban');
+});
+test('nonempty binary response remains unconfirmed rather than reporting success', async () => {
+  const writer = { put: async () => new ArrayBuffer(1) } as unknown as Pick<REST,'put'|'delete'|'post'>;
+  await assert.rejects(banDependencies({} as Client,guild,'test-token',deps,writer).applyBan(target,0,1,'ban'),/UNEXPECTED_RESPONSE/);
+});
