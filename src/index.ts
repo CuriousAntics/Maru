@@ -13,6 +13,8 @@ import { warningDependencies } from './warning-discord.js';
 import { parseStarboardEvent, enqueueStarboardEvent, startStarboardWorker } from './starboard-worker.js';
 import { starboardRuntimeDependencies } from './starboard-runtime-discord.js';
 import { starboardResources } from './starboard-discord.js';
+import { autoModResources, autoModDependencies } from './automod-discord.js';
+import { startAutoModWorker } from './automod-worker.js';
 import { createDashboardHandler } from './dashboard.js';
 import { dashboardConfig } from './web-security.js';
 import { Routes } from 'discord.js';
@@ -25,7 +27,7 @@ async function main(): Promise<void> {
   const listenPort = port();
   const pool = new pg.Pool({
     connectionString,
-    max: 3,
+    max: 5,
     connectionTimeoutMillis: 5000,
     idleTimeoutMillis: 30000,
     query_timeout: 5000,
@@ -61,6 +63,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    readAutoModResources: autoModResources(client, guildId),
     readStarboardResources: starboardResources(client, guildId),
     readMemberRoles: async (userId) => {
       try {
@@ -74,8 +77,11 @@ async function main(): Promise<void> {
   });
   const starboardWorker = startStarboardWorker(pool, guildId, starboardRuntimeDependencies(client, guildId, token),
     () => !stopping && client.isReady());
+  const autoModWorker = startAutoModWorker(pool, guildId, autoModDependencies(client, guildId, token),
+    () => !stopping && client.isReady());
   client.on(Events.Raw, (packet) => {
     if (stopping) return;
+    autoModWorker.accept(packet);
     const event = parseStarboardEvent(packet, guildId);
     if (event) void enqueueStarboardEvent(pool, event).catch(() => console.error('Starboard event could not be saved; observed messages will be rechecked.'));
   });
@@ -100,9 +106,10 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop()]);
+    if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
-      starboardWorker.stop(),
       pool.end(),
       new Promise<void>((resolve) => server.close(() => resolve())),
     ]);

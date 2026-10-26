@@ -67,3 +67,7 @@ export function escapeHtml(value: unknown): string {
 export function starboardProof(token: string, boardId: string, revision: number, action: 'create' | 'save' | 'delete'): string {
   return createHmac('sha256', token).update(`maru-starboard:${boardId}:${revision}:${action}`).digest('base64url');
 }
+
+export function autoModProof(token: string,revision: number): string {
+  return createHmac('sha256',token).update(`maru-automod-settings:${revision}`).digest('base64url');
+}

@@ -25,11 +25,12 @@ export function deliveryLabel(status: DeliveryStatus): string {
 }
 export function caseSummary(record: WarningCase): string {
   return `Case #${record.case_number} · ${actionLabel(record.action)} · ${record.action !== 'warning' ? 'Recorded' : record.state === 'void' ? 'Voided' : 'Active'}\nMember ID: ${record.target_user_id}\nStaff ID: ${record.actor_id}\n` +
+    (record.origin === 'automod' ? 'Origin: Automatic moderation\n' : '') +
     `Reason: ${escapeMarkdown(record.reason)}\nCreated: ${new Date(record.created_at).toISOString()}\n` +
     (record.action !== 'warning' ? `Action: ${actionResultLabel(record.action_status)}\n` : '') +
     (record.action === 'timeout' || record.action === 'untimeout' ? `Requested end UTC: ${record.requested_until ? new Date(record.requested_until).toISOString() : 'None (removal)'}\n` : '') +
     (record.action === 'ban' ? `Requested message deletion: ${record.delete_message_seconds === 0 ? 'Keep history' : durationLabel(record.delete_message_seconds!)}\nThe pre-ban DM is attempted before the ban; its delivery result is shown below.\n` : record.action === 'unban' ? 'No member DM is sent for unbans.\n' : '') +
-    `DM: ${record.action === 'unban' ? 'Not sent for unbans' : deliveryLabel(record.dm_status)}\nModeration log: ${deliveryLabel(record.log_status)}`;
+    `DM: ${record.action === 'unban' ? 'Not sent for unbans' : record.origin === 'automod' ? 'Not sent for automatic moderation' : deliveryLabel(record.dm_status)}\nModeration log: ${deliveryLabel(record.log_status)}`;
 }
 
 export async function handleWarning(
