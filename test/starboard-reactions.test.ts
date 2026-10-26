@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import type { Pool } from 'pg';
 import type { APIUser, APIMessage, Client, REST, RESTPostAPIChannelMessageJSONBody } from 'discord.js';
+import { deleteStarboard, loadBoardDeletions } from '../src/starboard-delete.js';
+import { digest } from '../src/web-security.js';
 import { enqueueStarboardEvent, parseStarboardEvent, processStarboardJob, sweepStarboards } from '../src/starboard-worker.js';
 import { chooseBoards, highlightBody, StarboardRuntimeError } from '../src/starboard-engine.js';
 import type { StarboardDependencies, StarboardSource, StarboardPost } from '../src/starboard-engine.js';
@@ -73,7 +75,7 @@ async function rows() { return (await query('SELECT * FROM starboard_posts ORDER
 async function jobRows() { return (await query('SELECT * FROM starboard_jobs')).rows as Record<string,unknown>[]; }
 function setVotes(ids: string[],key = 'u:⭐') { votes[`${key}:0`] = ids.map((id) => ({ id,username: 'human',discriminator: '0',avatar: null })); }
 before(async () => {
-  for (const name of ['001_foundation.sql','002_dashboard_auth.sql','007_starboard_settings.sql','008_starboard_reactions.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+  for (const name of ['001_foundation.sql','002_dashboard_auth.sql','007_starboard_settings.sql','008_starboard_reactions.sql','009_starboard_deletion.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
 });
 beforeEach(async () => {
   busy = failRequestAudit = failResultAudit = failUnlock = discarded = transaction = false;
@@ -344,4 +346,52 @@ test('a new delete event bypasses backoff from a lost create response', async ()
   onCreate = async () => { await enqueue(true); }; createFailure = 'after'; await enqueue(); await work();
   onCreate = undefined; createFailure = undefined;
   assert.equal(await work(),true); assert.equal(posts.size,0); assert.equal(calls.create,1);
+});
+
+
+async function deleteRuntimeBoard(removeHighlights: boolean,id = boardId,name = 'Highlights') {
+  const token = 'test-delete-session', role = '200000000000000001';
+  await query("INSERT INTO staff_roles (guild_id,role_id,access_level) VALUES ($1,$2,'moderator') ON CONFLICT DO NOTHING",[guild,role]);
+  await query(`INSERT INTO dashboard_sessions (token_hash,guild_id,user_id,display_name,expires_at) VALUES ($1,$2,$3,'Staff',NOW()+INTERVAL '1 hour') ON CONFLICT DO NOTHING`,[digest(token),guild,author]);
+  return deleteStarboard(pool,{ guildId: guild,actorId: author,sessionToken: token,boardId: id,revision: 0,confirmation: name,
+    reason: 'Delete test board',removeHighlights,readMemberRoles: async () => [role] });
+}
+test('deleting a board with Keep leaves its copy untouched through later reactions and source deletion', async () => {
+  await enqueue(); await work(); const retained = (await rows())[0]!.post_message_id!;
+  await deleteRuntimeBoard(false); await work(); assert.ok(posts.has(retained));
+  setVotes([]); await enqueue(); await work(); await enqueue(true); await work();
+  assert.ok(posts.has(retained)); assert.equal(calls.delete,0); assert.equal(calls.edit,0);
+});
+test('deleting with cleanup removes only that board’s copies and preserves another active board', async () => {
+  await query('UPDATE starboard_boards SET allow_crosspost=TRUE'); await addBoard({ board_id: board2,name: 'Second',destination_channel_id: otherDestination,allow_crosspost: true });
+  await enqueue(); await work(); assert.equal(posts.size,2);
+  await deleteRuntimeBoard(true); await work(); assert.equal(posts.size,1); assert.equal([...posts.values()][0]!.channel,otherDestination);
+  assert.deepEqual(await loadBoardDeletions(pool,guild),[]); assert.equal(calls.create,2);
+});
+test('deleted-board cleanup does not require source-channel access', async () => {
+  await enqueue(); await work(); await deleteRuntimeBoard(true); sourceFailure = true;
+  const reads = calls.read; await work(); assert.equal(posts.size,0); assert.equal(calls.read,reads);
+});
+test('deletion cleanup recovers an unconfirmed copy before removing it without a second POST', async () => {
+  createFailure = 'after'; await enqueue(); await work(); createFailure = undefined;
+  await deleteRuntimeBoard(true); await work(); assert.equal(posts.size,0); assert.equal(calls.create,1);
+});
+test('keeping an unconfirmed copy detaches it without retrying or deleting the possible message', async () => {
+  createFailure = 'after'; await enqueue(); await work(); createFailure = undefined;
+  await deleteRuntimeBoard(false); await work(); assert.equal(posts.size,1); assert.equal(calls.find,0); assert.equal(calls.delete,0);
+});
+test('cleanup with uncertain missing response stays visible for review and never reposts', async () => {
+  createFailure = 'before'; await enqueue(); await work(); createFailure = undefined;
+  await deleteRuntimeBoard(true); await work(); assert.equal(calls.create,1);
+  assert.equal((await loadBoardDeletions(pool,guild))[0]!.uncertain_count,1);
+});
+test('deletion cleanup survives a lost delete response and completes after restart', async () => {
+  await enqueue(); await work(); await deleteRuntimeBoard(true); deleteFailure = true; await work();
+  assert.equal(posts.size,0); assert.equal((await loadBoardDeletions(pool,guild)).length,1);
+  deleteFailure = false; await retry(); assert.deepEqual(await loadBoardDeletions(pool,guild),[]); assert.equal(calls.delete,1);
+});
+test('deleting an exclusive board releases its claim to another qualifying board', async () => {
+  await addBoard({ board_id: board2,name: 'Second',destination_channel_id: otherDestination }); await enqueue(); await work();
+  await deleteRuntimeBoard(false); await work(); assert.equal(posts.size,2); assert.equal(calls.create,2);
+  assert.ok([...posts.values()].some((post) => post.channel === otherDestination));
 });

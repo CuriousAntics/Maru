@@ -31,7 +31,7 @@ export const isDiscordMissing = (error: unknown) => !!error && typeof error === 
 const isRejection = (error: unknown) => !!error && typeof error === 'object' && 'status' in error && [400,401,403,404].includes(Number(error.status));
 export const runtimeCode = (error: unknown): string => error instanceof StarboardRuntimeError ? error.code : 'DISCORD_OR_DATABASE_UNAVAILABLE';
 export function chooseBoards(boards: StarboardBoard[],source: StarboardSource,counts: Map<string,number>): StarboardBoard[] {
-  const eligible = boards.filter((board) => board.enabled && board.source_channel_ids.includes(source.channelId) &&
+  const eligible = boards.filter((board) => !board.deleted_at && board.enabled && board.source_channel_ids.includes(source.channelId) &&
     board.destination_channel_id !== source.channelId && (counts.get(board.emoji_key) ?? 0) >= board.threshold);
   const chosen: StarboardBoard[] = [];
   for (const board of eligible) if (!chosen.length || (board.allow_crosspost && chosen.every((entry) => entry.allow_crosspost))) chosen.push(board);
@@ -55,19 +55,10 @@ export function highlightBody(board: StarboardBoard,source: StarboardSource,coun
 export async function reconcileStarboard(client: PoolClient,job: StarboardJob,deps: StarboardDependencies): Promise<void> {
   const guildId = job.guild_id;
   const boards = (await client.query<StarboardBoard>('SELECT * FROM starboard_boards WHERE guild_id=$1 ORDER BY created_at,board_id',[guildId])).rows;
-  let source = job.source_deleted ? null : await deps.readSource(job.source_channel_id,job.source_message_id);
-  if (source && (source.id !== job.source_message_id || source.channelId !== job.source_channel_id)) throw new StarboardRuntimeError('INVALID_SOURCE_RESPONSE');
-  if (!source) await client.query('UPDATE starboard_jobs SET source_deleted=TRUE WHERE guild_id=$1 AND source_message_id=$2',[guildId,job.source_message_id]);
-  const counts = new Map<string,number>();
-  if (source && source.authorId !== deps.botId()) {
-    for (const board of boards) if (board.enabled && board.source_channel_ids.includes(source.channelId) && !counts.has(board.emoji_key)) {
-      const count = await deps.countVotes(source,board.emoji_key);
-      if (!Number.isSafeInteger(count) || count < 0 || count > 100000) throw new StarboardRuntimeError('INVALID_REACTION_COUNT');
-      counts.set(board.emoji_key,count);
-    }
-  } else source = null;
-  const chosen = source ? chooseBoards(boards,source,counts) : [];
-  const entries = (await client.query<StarboardPost>('SELECT * FROM starboard_posts WHERE guild_id=$1 AND source_message_id=$2',[guildId,job.source_message_id])).rows;
+  const entries = (await client.query<StarboardPost>('SELECT * FROM starboard_posts WHERE guild_id=$1 AND source_message_id=$2',[guildId,job.source_message_id])).rows.filter((entry) => {
+    const board = boards.find((candidate) => candidate.board_id === entry.board_id);
+    return !board?.deleted_at || board.delete_remove_highlights;
+  });
   const map = new Map(entries.map((entry) => [entry.board_id,entry]));
   async function auditState(entry: StarboardPost,state: StarboardPost['state'],event: string,postId: string | null,hash: string | null = null) {
     let transaction = false;
@@ -83,12 +74,13 @@ export async function reconcileStarboard(client: PoolClient,job: StarboardJob,de
     entry.state = state; entry.post_message_id = postId; entry.body_hash = hash;
   }
   // Recover an uncertain create through a bot-owned marker, never by issuing another POST.
-  for (const entry of entries) if (entry.state === 'creating') {
+  async function recover(entry: StarboardPost) {
+    if (entry.state !== 'creating') return;
     let id: string | null;
     try { id = await deps.findCreated(entry); }
     catch (error) {
       if (error instanceof StarboardRuntimeError && error.code === 'DESTINATION_DELETED') {
-        await auditState(entry,'absent','STARBOARD_DESTINATION_REMOVED',null); continue;
+        await auditState(entry,'absent','STARBOARD_DESTINATION_REMOVED',null); return;
       }
       throw error;
     }
@@ -96,14 +88,38 @@ export async function reconcileStarboard(client: PoolClient,job: StarboardJob,de
     if (!/^\d{17,20}$/.test(id)) throw new StarboardRuntimeError('INVALID_RECOVERY_RESPONSE');
     await auditState(entry,'posted','STARBOARD_POST_RECOVERED',id);
   }
+  async function remove(entry: StarboardPost) {
+    await recover(entry);
+    if (entry.state === 'absent') return;
+    if (entry.state !== 'deleting') await auditState(entry,'deleting','STARBOARD_DELETE_REQUESTED',entry.post_message_id);
+    if (await deps.inspectPost(entry)) await deps.deletePost(entry);
+    await auditState(entry,'absent','STARBOARD_POST_REMOVED',null);
+  }
+  // Explicit board cleanup does not require access to the original source channel.
+  for (const entry of entries) {
+    const board = boards.find((candidate) => candidate.board_id === entry.board_id);
+    if (board?.deleted_at && board.delete_remove_highlights) await remove(entry);
+  }
+  const shouldReadSource = !job.source_deleted && boards.some((board) => !board.deleted_at && board.enabled && board.source_channel_ids.includes(job.source_channel_id));
+  let source = shouldReadSource ? await deps.readSource(job.source_channel_id,job.source_message_id) : null;
+  if (source && (source.id !== job.source_message_id || source.channelId !== job.source_channel_id)) throw new StarboardRuntimeError('INVALID_SOURCE_RESPONSE');
+  if (shouldReadSource && !source) await client.query('UPDATE starboard_jobs SET source_deleted=TRUE WHERE guild_id=$1 AND source_message_id=$2',[guildId,job.source_message_id]);
+  const counts = new Map<string,number>();
+  if (source && source.authorId !== deps.botId()) {
+    for (const board of boards) if (!board.deleted_at && board.enabled && board.source_channel_ids.includes(source.channelId) && !counts.has(board.emoji_key)) {
+      const count = await deps.countVotes(source,board.emoji_key);
+      if (!Number.isSafeInteger(count) || count < 0 || count > 100000) throw new StarboardRuntimeError('INVALID_REACTION_COUNT');
+      counts.set(board.emoji_key,count);
+    }
+  } else source = null;
+  const chosen = source ? chooseBoards(boards,source,counts) : [];
+  for (const entry of entries) await recover(entry);
   // Confirm removals before adding any competing board or changing a destination.
   for (const entry of entries) {
     const wanted = chosen.find((board) => board.board_id === entry.board_id);
     if (entry.state === 'absent') continue;
     if (!wanted || wanted.destination_channel_id !== entry.destination_channel_id || entry.state === 'deleting') {
-      if (entry.state !== 'deleting') await auditState(entry,'deleting','STARBOARD_DELETE_REQUESTED',entry.post_message_id);
-      if (await deps.inspectPost(entry)) await deps.deletePost(entry);
-      await auditState(entry,'absent','STARBOARD_POST_REMOVED',null);
+      await remove(entry);
     }
   }
   if (!source) return;

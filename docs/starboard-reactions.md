@@ -59,3 +59,7 @@ Live test in **Maru Development** after deployment:
 6. For a multiple-board test, allow cross-posting on both boards and check each destination. Turn one board Off and verify only its copies are removed.
 
 Use the dashboard's posting state to confirm On before testing. Existing boards default to Off deliberately; the worker does not automatically activate previously saved settings.
+
+## Deleting a board
+
+Deleting a board offers a per-deletion choice to keep its existing highlights or remove its managed copies. Kept highlights become unmanaged snapshots. See [starboard-deletion.md](starboard-deletion.md) for confirmation, audit and cleanup behavior.

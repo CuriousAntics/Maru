@@ -64,6 +64,6 @@ export function escapeHtml(value: unknown): string {
   })[char]!);
 }
 
-export function starboardProof(token: string, boardId: string, revision: number, action: 'create' | 'save'): string {
+export function starboardProof(token: string, boardId: string, revision: number, action: 'create' | 'save' | 'delete'): string {
   return createHmac('sha256', token).update(`maru-starboard:${boardId}:${revision}:${action}`).digest('base64url');
 }

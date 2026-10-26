@@ -11,6 +11,7 @@ import { createDashboardHandler } from '../src/dashboard.js';
 import { digest, randomToken, starboardProof, settingsProof } from '../src/web-security.js';
 import { saveStarboard, loadStarboards, resolveBoardEmoji, StarboardSettingsError } from '../src/starboard-settings.js';
 import type { StarboardResources } from '../src/starboard-settings.js';
+import { deleteStarboard, loadBoardDeletions } from '../src/starboard-delete.js';
 import { starboardResources } from '../src/starboard-discord.js';
 
 const db = new PGlite();
@@ -24,7 +25,7 @@ let failAudit = false, failResources = false, botReady = true;
 let roleHook: (() => Promise<void>) | undefined;
 let resources: StarboardResources;
 async function query(sql: string, values?: unknown[]) {
-  if (failAudit && String(values?.[2]).startsWith('STARBOARD_')) throw new Error('test audit failure');
+  if (failAudit && (String(values?.[2]).startsWith('STARBOARD_') || sql.includes("'STARBOARD_DELETED'"))) throw new Error('test audit failure');
   const result = await db.query(sql,values); return { rows: result.rows,rowCount: result.rows.length || result.affectedRows || 0 };
 }
 const pool = { query,async connect() { return { query,release() {} }; } } as unknown as Pool;
@@ -58,7 +59,7 @@ async function post(body: URLSearchParams | string = form(),id = boardId,action 
   return request(`/starboards/${id}/${action}`,{ method: 'POST',headers: { origin: base,'content-type': 'application/x-www-form-urlencoded',...headers },body });
 }
 before(async () => {
-  for (const name of ['001_foundation.sql','002_dashboard_auth.sql','007_starboard_settings.sql','008_starboard_reactions.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+  for (const name of ['001_foundation.sql','002_dashboard_auth.sql','007_starboard_settings.sql','008_starboard_reactions.sql','009_starboard_deletion.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
   await new Promise<void>((resolve) => server.listen(0,'127.0.0.1',resolve)); base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
@@ -291,4 +292,118 @@ test('authorized staff can switch posting off even if saved channel resources ar
   await save({ enabled: true }); failResources = true;
   await save({ action: 'save',enabled: false });
   assert.equal((await loadStarboards(pool,guild))[0]!.enabled,false);
+});
+
+
+function deleteInput(overrides: Record<string,unknown> = {}) {
+  return { guildId: guild,actorId: actor,sessionToken,boardId,revision: 0,confirmation: 'Community highlights',
+    removeHighlights: false,reason: 'Remove test board',readMemberRoles: readRoles,...overrides };
+}
+function deleteForm(overrides: Record<string,string> = {}) {
+  return new URLSearchParams({ csrf: starboardProof(sessionToken,boardId,0,'delete'),revision: '0',confirmation: 'Community highlights',reason: 'Remove test board',...overrides });
+}
+async function postDelete(body: URLSearchParams | string = deleteForm(),headers: Record<string,string> = {}) {
+  return request(`/starboards/${boardId}/delete`,{ method: 'POST',headers: { origin: base,'content-type': 'application/x-www-form-urlencoded',...headers },body });
+}
+async function seedPosted() {
+  await query(`INSERT INTO starboard_posts (guild_id,board_id,source_channel_id,source_message_id,destination_channel_id,state,marker,post_message_id)
+    VALUES ($1,$2,$3,$4,$5,'posted','managed highlight',$6)`,[guild,boardId,source,'900000000000000001',destination,'800000000000000001']);
+}
+test('delete keeps highlights by default, hides the board and preserves an immutable audit record', async () => {
+  await save({ enabled: true }); await seedPosted();
+  assert.equal(await deleteStarboard(pool,deleteInput()),'changed'); assert.deepEqual(await loadStarboards(pool,guild),[]);
+  const record = (await db.query<{ state: string; post_message_id: string | null; retained_post_message_id: string }>('SELECT * FROM starboard_posts')).rows[0]!;
+  assert.equal(record.state,'absent'); assert.equal(record.post_message_id,null); assert.equal(record.retained_post_message_id,'800000000000000001');
+  const audit = (await events())[1]!; assert.equal(audit.event_type,'STARBOARD_DELETED'); assert.equal(audit.details.remove_highlights,false);
+  assert.equal(audit.details.known_highlights,1); assert.equal((audit.details.before as Record<string,unknown>).enabled,true);
+});
+test('deletion with cleanup preserves live post ownership and exposes pending removal', async () => {
+  await save({ enabled: true }); await seedPosted();
+  await deleteStarboard(pool,deleteInput({ removeHighlights: true }));
+  assert.equal((await db.query<{ state: string }>('SELECT state FROM starboard_posts')).rows[0]!.state,'posted');
+  const pending = await loadBoardDeletions(pool,guild); assert.equal(pending[0]!.pending_count,1);
+  const html = await (await request('/starboards')).text(); assert.match(html,/awaiting removal/); assert.ok(!html.includes('Edit board'));
+});
+test('repeated deletion is idempotent and cannot change the original keep/remove choice', async () => {
+  await save(); const data = deleteInput(); await deleteStarboard(pool,data); assert.equal(await deleteStarboard(pool,data),'unchanged');
+  await assert.rejects(deleteStarboard(pool,{ ...data,removeHighlights: true }),/STALE_BOARD/); assert.equal((await events()).length,2);
+});
+test('confirmation and stale revisions prevent unintended deletion', async () => {
+  await save(); await assert.rejects(deleteStarboard(pool,deleteInput({ confirmation: 'Wrong board' })),/CONFIRM_REQUIRED/);
+  await save({ action: 'save',threshold: 8 }); await assert.rejects(deleteStarboard(pool,deleteInput()),/STALE_BOARD/);
+  assert.equal((await loadStarboards(pool,guild)).length,1);
+});
+test('ordinary Mods can delete boards without a full access grant', async () => {
+  await save(); roles = [modRole]; await deleteStarboard(pool,deleteInput()); assert.equal((await loadStarboards(pool,guild)).length,0);
+});
+test('deleted names can be reused and stale edit forms cannot resurrect a deleted board', async () => {
+  await save(); await deleteStarboard(pool,deleteInput()); await code({ action: 'save' },'BOARD_NOT_FOUND');
+  await save({ boardId: secondId }); assert.equal((await loadStarboards(pool,guild))[0]!.board_id,secondId);
+  await assert.rejects(query('UPDATE starboard_boards SET enabled=TRUE WHERE board_id=$1',[boardId]),/STARBOARD_DELETED_READ_ONLY/);
+});
+test('deletion needs a current session and current staff roles inside the transaction', async () => {
+  await save(); roles = []; await assert.rejects(deleteStarboard(pool,deleteInput()),/STAFF_REQUIRED/); roles = [adminRole];
+  await assert.rejects(deleteStarboard(pool,deleteInput({ sessionToken: randomToken() })),/SESSION_EXPIRED/);
+  await assert.rejects(deleteStarboard(pool,deleteInput({ guildId: otherGuild })),/SESSION_EXPIRED/);
+  assert.equal((await loadStarboards(pool,guild)).length,1);
+});
+test('delete requires a bounded reason, valid inputs and an existing board', async () => {
+  await assert.rejects(deleteStarboard(pool,deleteInput()),/BOARD_NOT_FOUND/);
+  await save(); for (const reason of [' ','x'.repeat(501)]) await assert.rejects(deleteStarboard(pool,deleteInput({ reason })),/INVALID_REASON/);
+  await assert.rejects(deleteStarboard(pool,deleteInput({ revision: -1 })),/INVALID_INPUT/);
+  await assert.rejects(deleteStarboard(pool,deleteInput({ removeHighlights: 'true' })),/INVALID_INPUT/);
+});
+test('audit failure rolls back board deletion, ownership changes and queue writes together', async () => {
+  await save({ enabled: true }); await seedPosted(); failAudit = true;
+  await assert.rejects(deleteStarboard(pool,deleteInput()),/test audit failure/);
+  assert.equal((await loadStarboards(pool,guild))[0]!.enabled,true);
+  assert.equal((await db.query<{ state: string }>('SELECT state FROM starboard_posts')).rows[0]!.state,'posted');
+  assert.equal((await events()).length,1); assert.equal((await db.query('SELECT * FROM starboard_jobs')).rows.length,0);
+});
+test('board deletion does not depend on available Discord channel resources', async () => {
+  await save(); failResources = true;
+  assert.equal((await request(`/starboards/${boardId}/delete-confirm`)).status,200);
+  assert.equal((await postDelete()).status,303); assert.equal((await loadStarboards(pool,guild)).length,0);
+});
+test('delete page offers an unchecked cleanup checkbox and escapes the displayed name', async () => {
+  await save({ name: '<b>Highlights</b>' });
+  const html = await (await request(`/starboards/${boardId}/delete-confirm`)).text();
+  assert.match(html,/&lt;b&gt;Highlights&lt;\/b&gt;/); assert.ok(!html.includes('<b>Highlights</b>'));
+  assert.match(html,/name="remove_highlights" value="true">/); assert.ok(!html.includes('value="true" checked'));
+  assert.match(html,/unmanaged snapshots/); assert.match(html,/Original source messages/);
+});
+test('HTTP deletion checks method origin content type and purpose-bound CSRF', async () => {
+  await save(); assert.equal((await request(`/starboards/${boardId}/delete`)).status,405);
+  for (const origin of ['https://elsewhere.test','null','']) assert.equal((await postDelete(deleteForm(),{ origin })).status,403);
+  assert.equal((await postDelete(deleteForm(),{ 'content-type': 'application/json' })).status,403);
+  for (const csrf of [settingsProof(sessionToken),starboardProof(sessionToken,boardId,0,'save'),starboardProof(sessionToken,secondId,0,'delete'),starboardProof(sessionToken,boardId,1,'delete')]) {
+    assert.equal((await postDelete(deleteForm({ csrf }))).status,403);
+  }
+  assert.equal((await loadStarboards(pool,guild)).length,1);
+});
+test('HTTP delete rejects missing duplicate unknown oversized and malformed fields', async () => {
+  await save(); const duplicate = deleteForm(); duplicate.append('remove_highlights','true'); duplicate.append('remove_highlights','true');
+  assert.equal((await postDelete(duplicate)).status,400);
+  const unknown = deleteForm(); unknown.append('guild_id',otherGuild); assert.equal((await postDelete(unknown)).status,400);
+  const missing = deleteForm(); missing.delete('reason'); assert.equal((await postDelete(missing)).status,400);
+  assert.equal((await postDelete(deleteForm({ remove_highlights: 'false' }))).status,400);
+  assert.equal((await postDelete(deleteForm({ revision: '01' }))).status,400); assert.equal((await postDelete('x'.repeat(8193))).status,413);
+});
+test('HTTP delete keeps messages by default and refreshing its result never repeats the mutation', async () => {
+  await save(); const result = await postDelete(); assert.equal(result.status,303);
+  const html = await (await request(result.headers.get('location')!)).text(); assert.match(html,/Existing highlights were kept/);
+  await request(result.headers.get('location')!); assert.equal((await events()).length,2);
+  assert.equal((await request(`/starboards/${boardId}`)).status,404);
+});
+test('HTTP deletion rechecks current roles and rejects an expired session', async () => {
+  await save(); let calls = 0; roleHook = async () => { if (++calls === 2) roles = []; };
+  assert.equal((await postDelete()).status,403); roleHook = undefined; roles = [adminRole];
+  await query("UPDATE dashboard_sessions SET expires_at=NOW()-INTERVAL '1 second'"); assert.equal((await postDelete()).status,303);
+  assert.equal((await loadStarboards(pool,guild)).length,1);
+});
+test('deleted boards stop counting against the 25-board limit', async () => {
+  await save(); await deleteStarboard(pool,deleteInput());
+  await db.query(`INSERT INTO starboard_boards (guild_id,board_id,name,destination_channel_id,emoji,emoji_key,threshold,source_channel_ids,created_by,updated_by)
+    SELECT $1,('aaaaaaaa-aaaa-4aaa-8aaa-' || lpad(n::text,12,'0'))::uuid,'Board '||n,$2,'⭐','u:⭐',3,ARRAY[$3],$4,$4 FROM generate_series(1,24) n`,[guild,destination,source,actor]);
+  await save({ boardId: secondId,name: 'Last active board' }); assert.equal((await loadStarboards(pool,guild)).length,25);
 });
