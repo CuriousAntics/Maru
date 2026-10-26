@@ -41,3 +41,5 @@ After deployment, if an existing development test warning is available:
 5. An ordinary Mod should have controls only on their own cases; an Admin or full-access Mod should have controls on any Active case.
 
 If no test case is available, leave live mutation checks pending. No new member warning is needed solely to open or browse these pages. The separate closed-DM live test also remains paused.
+
+Timeout and timeout-removal cases are read only. Use `/untimeout` for a live timeout removal; the warning correction/voiding controls do not change Discord punishment state. See [Manual timeouts](timeouts.md).

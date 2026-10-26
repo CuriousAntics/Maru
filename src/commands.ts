@@ -39,3 +39,16 @@ export const caseLookup = new SlashCommandBuilder()
   .setDescription('Look up a saved moderation case in this server (staff only).')
   .addIntegerOption((option) => option.setName('number').setDescription('Server case number')
     .setMinValue(1).setMaxValue(2147483647).setRequired(true));
+
+export const timeout = new SlashCommandBuilder().setName('timeout')
+  .setDescription('Set or replace a member timeout (staff and Discord permissions required).')
+  .addUserOption((option) => option.setName('member').setDescription('Member to time out').setRequired(true))
+  .addStringOption((option) => option.setName('duration').setDescription('For example 30s, 10m, 2h, 1d, or 1w; maximum 28d')
+    .setMinLength(2).setMaxLength(32).setRequired(true))
+  .addStringOption((option) => option.setName('reason').setDescription('Why this timeout is being applied')
+    .setMinLength(1).setMaxLength(500).setRequired(true));
+export const untimeout = new SlashCommandBuilder().setName('untimeout')
+  .setDescription('Remove an active member timeout and record the action.')
+  .addUserOption((option) => option.setName('member').setDescription('Member whose timeout should be removed').setRequired(true))
+  .addStringOption((option) => option.setName('reason').setDescription('Why the timeout should be removed')
+    .setMinLength(1).setMaxLength(500).setRequired(true));

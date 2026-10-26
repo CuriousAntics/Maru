@@ -55,4 +55,4 @@ Live checks in the private test server:
 6. With the test member's consent, repeat using a new reason after they close their DMs to server members. The new warning should remain saved and report DM Failed while the staff log succeeds.
 7. Confirm an unmapped member cannot issue `/warn` or read `/case`. Ordinary Mods should be able to warn only an eligible lower-ranked ordinary member.
 
-These checks create real persistent warning cases in the test server. The dashboard now supports [case corrections and voiding](case-changes.md), with ownership permissions and retained history. Imports, timeout/ban actions, and website warning creation are not included yet.
+These checks create real persistent warning cases in the test server. The dashboard now supports [case corrections and voiding](case-changes.md), with ownership permissions and retained history. Manual [timeouts and timeout removal](timeouts.md) are now available as separate native actions. Imports, bans, and website warning creation are not included yet.

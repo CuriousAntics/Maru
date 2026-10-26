@@ -9,14 +9,18 @@ import type { LogChannel } from './server-settings.js';
 export class WarningError extends Error {
   constructor(public readonly code: string) { super(code); }
 }
-export type DeliveryStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'unconfirmed' | 'not_configured';
+export type DeliveryStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'unconfirmed' | 'not_configured' | 'skipped';
 export type WarningCase = {
-  guild_id: string; case_number: number; request_id: string; action: 'warning';
+  guild_id: string; case_number: number; request_id: string; action: 'warning' | 'timeout' | 'untimeout';
   actor_id: string; target_user_id: string; reason: string; guild_name: string;
   log_channel_id: string | null; dm_status: DeliveryStatus; log_status: DeliveryStatus;
   dm_message_id: string | null; log_message_id: string | null; created_at: Date;
   original_reason: string; state: 'active' | 'void'; revision: number; updated_at: Date;
   last_changed_by: string | null; void_reason: string | null;
+  action_status: 'not_applicable' | 'pending' | 'applying' | 'applied' | 'rejected' | 'unconfirmed';
+  duration_seconds: number | null; requested_until: Date | null; previous_until: Date | null;
+  action_attempted_at: Date | null; action_completed_at: Date | null; action_error: string | null;
+  notification_claimed_at: Date | null;
 };
 export type WarningContext = {
   actorRoleIds: string[]; targetRoleIds: string[];
@@ -56,7 +60,7 @@ export async function createWarning(pool: Database, input: {
     const prior = await client.query<WarningCase>(
       'SELECT * FROM moderation_cases WHERE guild_id = $1 AND request_id = $2', [input.guildId, input.requestId]);
     if (prior.rows[0]) {
-      if (prior.rows[0].actor_id !== input.actorId || prior.rows[0].target_user_id !== input.targetId || prior.rows[0].original_reason !== reason) {
+      if (prior.rows[0].action !== 'warning' || prior.rows[0].actor_id !== input.actorId || prior.rows[0].target_user_id !== input.targetId || prior.rows[0].original_reason !== reason) {
         throw new WarningError('REQUEST_MISMATCH');
       }
       await client.query('COMMIT'); transaction = false;
@@ -125,11 +129,13 @@ export function warningMessage(record: WarningCase, kind: 'dm' | 'log'): RESTPos
 }
 
 // Claim both deliveries once. A restart or duplicate interaction never silently repeats a DM/log.
-export async function deliverWarning(pool: Database, record: WarningCase, deps: WarningDependencies): Promise<WarningCase> {
+export async function deliverWarning(pool: Database, record: WarningCase, deps: WarningDependencies,
+  messageBuilder: typeof warningMessage = warningMessage): Promise<WarningCase> {
   const claim = await pool.query<WarningCase>(
-    `UPDATE moderation_cases SET dm_status = 'sending',
+    `UPDATE moderation_cases SET notification_claimed_at=NOW(), dm_status = CASE WHEN dm_status='pending' THEN 'sending' ELSE dm_status END,
        log_status = CASE WHEN log_status = 'pending' THEN 'sending' ELSE log_status END
-     WHERE guild_id = $1 AND case_number = $2 AND dm_status = 'pending' AND state = 'active' RETURNING *`,
+     WHERE guild_id = $1 AND case_number = $2 AND dm_status IN ('pending','skipped') AND notification_claimed_at IS NULL AND state='active'
+       AND (action='warning' OR action_status IN ('applied','rejected','unconfirmed')) RETURNING *`,
     [record.guild_id, record.case_number]);
   if (!claim.rows[0]) {
     const current = await pool.query<WarningCase>(
@@ -139,7 +145,7 @@ export async function deliverWarning(pool: Database, record: WarningCase, deps: 
   }
   record = claim.rows[0];
   async function deliver(kind: 'dm' | 'log'): Promise<void> {
-    if (kind === 'log' && !record.log_channel_id) return;
+    if ((kind === 'log' && !record.log_channel_id) || (kind === 'dm' && record.dm_status === 'skipped')) return;
     let status: 'sent' | 'failed' | 'unconfirmed' = 'unconfirmed';
     let messageId: string | null = null;
     try {
@@ -148,12 +154,12 @@ export async function deliverWarning(pool: Database, record: WarningCase, deps: 
         if (!channels.some((channel) => channel.id === record.log_channel_id && channel.usable)) {
           status = 'failed';
         } else {
-          const sent = await deps.sendLog(record.log_channel_id!, warningMessage(record, kind));
+          const sent = await deps.sendLog(record.log_channel_id!, messageBuilder(record, kind));
           if (!isId(sent.id)) throw new Error('INVALID_DELIVERY_RESPONSE');
           messageId = sent.id; status = 'sent';
         }
       } else {
-        const sent = await deps.sendDM(record.target_user_id, warningMessage(record, kind));
+        const sent = await deps.sendDM(record.target_user_id, messageBuilder(record, kind));
         if (!isId(sent.id)) throw new Error('INVALID_DELIVERY_RESPONSE');
         messageId = sent.id; status = 'sent';
       }
@@ -174,7 +180,7 @@ export async function deliverWarning(pool: Database, record: WarningCase, deps: 
         [record.guild_id, record.case_number, status, messageId]);
       await client.query(
         `INSERT INTO audit_events (guild_id, actor_id, event_type, details) VALUES ($1,$2,$3,$4::jsonb)`,
-        [record.guild_id, record.actor_id, `WARNING_${kind.toUpperCase()}_${status.toUpperCase()}`,
+        [record.guild_id, record.actor_id, `${record.action === 'warning' ? 'WARNING' : record.action.toUpperCase()}_${kind.toUpperCase()}_${status.toUpperCase()}`,
           JSON.stringify({ case_number: record.case_number, target_user_id: record.target_user_id,
             channel_id: kind === 'log' ? record.log_channel_id : undefined, message_id: messageId,
             reason: status === 'sent' ? 'Discord confirmed message creation.' : status === 'failed'

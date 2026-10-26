@@ -38,6 +38,7 @@ export async function changeCase(pool: Pick<Pool, 'connect'>, input: {
     const result = await client.query<WarningCase>(
       'SELECT * FROM moderation_cases WHERE guild_id = $1 AND case_number = $2 FOR UPDATE', [input.guildId, input.caseNumber]);
     const previous = result.rows[0];
+    if (previous && previous.action !== 'warning') throw new CaseChangeError('ACTION_READ_ONLY');
     if (!previous) throw new CaseChangeError('CASE_NOT_FOUND');
     if (access !== 'admin' && previous.actor_id !== input.actorId) throw new CaseChangeError('ACCESS_DENIED');
     if (previous.revision !== input.expectedRevision) throw new CaseChangeError('STALE_CASE');
