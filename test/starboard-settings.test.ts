@@ -52,13 +52,13 @@ async function request(path: string,init: RequestInit = {}) {
 }
 function form(overrides: Record<string,string> = {}, id = boardId, revision = 0, action: 'create' | 'save' = 'create') {
   return new URLSearchParams({ csrf: starboardProof(sessionToken,id,revision,action),revision: String(revision),name: 'Community highlights',
-    destination_id: destination,emoji: '⭐',threshold: '3',source_id: source,allow_crosspost: 'false',reason: 'Initial setup',...overrides });
+    destination_id: destination,emoji: '⭐',threshold: '3',source_id: source,allow_crosspost: 'false',enabled: 'false',reason: 'Initial setup',...overrides });
 }
 async function post(body: URLSearchParams | string = form(),id = boardId,action = 'create',headers: Record<string,string> = {}) {
   return request(`/starboards/${id}/${action}`,{ method: 'POST',headers: { origin: base,'content-type': 'application/x-www-form-urlencoded',...headers },body });
 }
 before(async () => {
-  for (const name of ['001_foundation.sql','002_dashboard_auth.sql','007_starboard_settings.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+  for (const name of ['001_foundation.sql','002_dashboard_auth.sql','007_starboard_settings.sql','008_starboard_reactions.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
   await new Promise<void>((resolve) => server.listen(0,'127.0.0.1',resolve)); base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
@@ -68,7 +68,7 @@ beforeEach(async () => {
     { id: source,name: 'general',sourceUsable: true,destinationUsable: false },
     { id: source2,name: 'artwork',sourceUsable: true,destinationUsable: true },
   ],emojis: [{ id: emojiId,name: 'marustar',animated: false,usable: true }] };
-  await db.exec('TRUNCATE starboard_boards,dashboard_login_attempts,dashboard_sessions,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
+  await db.exec('TRUNCATE starboard_jobs,starboard_posts,starboard_boards,dashboard_login_attempts,dashboard_sessions,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
   await query('INSERT INTO guild_settings (guild_id,settings) VALUES ($1,$3::jsonb),($2,$3::jsonb)',[guild,otherGuild,JSON.stringify({ moderation_log_channel_id: source2,other: 'keep' })]);
   await query("INSERT INTO staff_roles (guild_id,role_id,access_level) VALUES ($1,$3,'admin'),($1,$4,'moderator'),($2,$3,'admin')",[guild,otherGuild,adminRole,modRole]);
   await query("INSERT INTO dashboard_sessions (token_hash,guild_id,user_id,display_name,expires_at) VALUES ($1,$2,$3,'Test staff',NOW()+INTERVAL '8 hours')",[digest(sessionToken),guild,actor]);
@@ -81,7 +81,7 @@ test('Admin creates a paused board and full settings audit atomically', async ()
   assert.equal(board.name,'Community highlights'); assert.equal(board.threshold,3); assert.equal(board.enabled,false); assert.equal(board.emoji_key,'u:⭐'); assert.equal(board.revision,0);
   assert.deepEqual(board.source_channel_ids,[source]); assert.equal(board.created_by,actor);
   const audit = (await events())[0]!; assert.equal(audit.event_type,'STARBOARD_CREATED'); assert.equal(audit.details.before,null);
-  assert.deepEqual(audit.details.after,{ name: board.name,destination_channel_id: destination,emoji: '⭐',emoji_key: 'u:⭐',threshold: 3,source_channel_ids: [source],allow_crosspost: false });
+  assert.deepEqual(audit.details.after,{ name: board.name,destination_channel_id: destination,emoji: '⭐',emoji_key: 'u:⭐',threshold: 3,source_channel_ids: [source],allow_crosspost: false,enabled: false });
 });
 test('ordinary Mods can create and edit boards without a full access grant', async () => {
   roles = [modRole]; await save(); await save({ action: 'save',threshold: 5,allowCrosspost: true });
@@ -168,7 +168,7 @@ test('HTTP list and forms require authentication; missing routes and wrong metho
 });
 test('ordinary Mod can create a board through a protected form and refresh without writing again', async () => {
   roles = [modRole]; const page = await request('/starboards/new'); const html = await page.text();
-  assert.match(html,/Settings only/); assert.match(html,/Posting|posting/); assert.equal(page.headers.get('referrer-policy'),'same-origin');
+  assert.match(html,/Reaction posting/); assert.match(html,/Posting|posting/); assert.equal(page.headers.get('referrer-policy'),'same-origin');
   const result = await post(); assert.equal(result.status,303); assert.equal(result.headers.get('location'),`/starboards/${boardId}`);
   const edit = await request(result.headers.get('location')!); assert.equal(edit.status,200); assert.match(await edit.text(),/Save board/);
   await request(`/starboards/${boardId}`); assert.equal((await events()).length,1);
@@ -262,4 +262,33 @@ test('HTTP edit saves checked sources and cross-post choice and links the audit 
   assert.match(html,/value="8"/); assert.match(html,/value="true" selected/); assert.match(html,/Saved configuration · Revision 1/);
   assert.match(html,new RegExp(`value="${source2}" checked`));
   const overview = await (await request('/dashboard')).text(); assert.ok(overview.includes(`href="/starboards/${boardId}"`));
+});
+
+test('board enable and disable choices persist with a complete audit trail', async () => {
+  await save({ enabled: true }); assert.equal((await loadStarboards(pool,guild))[0]!.enabled,true);
+  await save({ action: 'save',enabled: false,reason: 'Pause posting' });
+  assert.equal((await loadStarboards(pool,guild))[0]!.enabled,false);
+  const last = (await events())[1]!.details; assert.equal((last.before as Record<string,unknown>).enabled,true); assert.equal((last.after as Record<string,unknown>).enabled,false);
+});
+test('HTTP form requires an explicit posting choice and persists On', async () => {
+  const missing = form(); missing.delete('enabled'); assert.equal((await post(missing)).status,400);
+  assert.equal((await post(form({ enabled: 'true' }))).status,303);
+  const html = await (await request(`/starboards/${boardId}`)).text(); assert.match(html,/value="true" selected>On/);
+});
+test('configuration changes queue already observed sources for reevaluation', async () => {
+  await save(); await query(`INSERT INTO starboard_jobs (guild_id,source_channel_id,source_message_id,version,processed_version) VALUES ($1,$2,$3,1,1)`,[guild,source,'900000000000000001']);
+  await save({ action: 'save',threshold: 7 });
+  const job = (await db.query<{ version: string; processed_version: string }>('SELECT version,processed_version FROM starboard_jobs')).rows[0]!;
+  assert.notEqual(job.version,job.processed_version);
+});
+test('unconfirmed deliveries are visible after a page refresh', async () => {
+  await save(); await query(`INSERT INTO starboard_posts (guild_id,board_id,source_channel_id,source_message_id,destination_channel_id,state,marker)
+    VALUES ($1,$2,$3,$4,$5,'creating','uncertain test')`,[guild,boardId,source,'900000000000000001',destination]);
+  const html = await (await request('/starboards')).text(); assert.match(html,/delivery needs review/);
+});
+
+test('authorized staff can switch posting off even if saved channel resources are unavailable', async () => {
+  await save({ enabled: true }); failResources = true;
+  await save({ action: 'save',enabled: false });
+  assert.equal((await loadStarboards(pool,guild))[0]!.enabled,false);
 });

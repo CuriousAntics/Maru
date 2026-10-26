@@ -33,18 +33,18 @@ export async function handleStarboardPage(request: IncomingMessage, path: string
         chunks.push(buffer);
       }
       const params = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
-      const keys = ['csrf','revision','name','destination_id','emoji','threshold','allow_crosspost','reason'];
+      const keys = ['csrf','revision','name','destination_id','emoji','threshold','allow_crosspost','enabled','reason'];
       if (keys.some((key) => params.getAll(key).length !== 1) || [...params.keys()].some((key) => ![...keys,'source_id'].includes(key))) throw new StarboardSettingsError('INVALID_INPUT');
       const revisionText = params.get('revision')!, thresholdText = params.get('threshold')!;
       if (!/^(0|[1-9]\d{0,9})$/.test(revisionText) || Number(revisionText) > 2147483647 || !/^[1-9]\d{0,3}$/.test(thresholdText) ||
-          !['true','false'].includes(params.get('allow_crosspost')!)) throw new StarboardSettingsError('INVALID_INPUT');
+          !['true','false'].includes(params.get('allow_crosspost')!) || !['true','false'].includes(params.get('enabled')!)) throw new StarboardSettingsError('INVALID_INPUT');
       const revision = Number(revisionText);
       if (!equal(params.get('csrf')!,starboardProof(sessionToken,boardId,revision,action))) {
         views.message(403,'Request rejected','Reload the board form before saving.'); return;
       }
       await saveStarboard(pool,{ guildId,actorId,sessionToken,boardId,action,revision,threshold: Number(thresholdText),
         name: params.get('name')!,destinationId: params.get('destination_id')!,emoji: params.get('emoji')!,sourceIds: params.getAll('source_id'),
-        allowCrosspost: params.get('allow_crosspost') === 'true',reason: params.get('reason')!,readResources,readMemberRoles });
+        allowCrosspost: params.get('allow_crosspost') === 'true',enabled: params.get('enabled') === 'true',reason: params.get('reason')!,readResources,readMemberRoles });
       views.redirect(`/starboards/${boardId}`); return;
     }
     const boards = await loadStarboards(pool,guildId);
@@ -61,6 +61,7 @@ export async function handleStarboardPage(request: IncomingMessage, path: string
   } catch (error) {
     if (!(error instanceof StarboardSettingsError)) throw error;
     const errors: Record<string,[number,string]> = {
+      WORKER_BUSY: [409,'Maru is updating highlights. Wait a moment, reload the board and save again.'],
       STAFF_REQUIRED: [403,'Your current roles no longer allow Starboard changes.'],
       SESSION_EXPIRED: [403,'Your session expired. Sign in again.'],
       SERVER_NOT_CONFIGURED: [409,'This server is not configured.'],
