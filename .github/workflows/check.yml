@@ -16,4 +16,4 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build
-      - run: node --import tsx --test test/staff-access.test.ts test/staff-grants.test.ts test/dashboard.test.ts test/warnings.test.ts test/timeouts.test.ts test/bans.test.ts test/starboard-settings.test.ts test/starboard-reactions.test.ts
+      - run: node --import tsx --test test/staff-access.test.ts test/staff-grants.test.ts test/dashboard.test.ts test/warnings.test.ts test/timeouts.test.ts test/bans.test.ts test/starboard-settings.test.ts test/starboard-reactions.test.ts test/automod.test.ts
