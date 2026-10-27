@@ -34,7 +34,7 @@ export function autoModDependencies(client: Client,guildId: string,token: string
         timeoutUntil: target?.communicationDisabledUntil?.toISOString() ?? null };
     },
     deleteMessage: async (channel,id) => {
-      try { const result=await writer.delete(Routes.channelMessage(channel,id),{ signal: AbortSignal.timeout(15000),reason: 'Maru blocked-word rule' });
+      try { const result=await writer.delete(Routes.channelMessage(channel,id),{ signal: AbortSignal.timeout(15000),reason: 'Maru automatic moderation rule' });
         if(result!==null && result!==undefined && !(result instanceof ArrayBuffer && result.byteLength===0)) throw new AutoModError('DELETE_UNCONFIRMED');
       } catch(error) { if(!missing(error)) throw error; }
     },

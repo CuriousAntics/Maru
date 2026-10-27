@@ -72,11 +72,11 @@ async function cases() { return (await query('SELECT * FROM moderation_cases ORD
 async function five() { for(let i=0;i<5;i++) await run(); }
 let base='',ready=true,handler: ReturnType<typeof createDashboardHandler>;
 const server=createServer((req,res) => { void handler(req,res); });
-async function request(path: string,init: RequestInit={}) { return fetch(base+path,{ ...init,redirect: 'manual',headers: { cookie: `maru_session=${token}`,...init.headers } }); }
+async function request(path: string,init: RequestInit={}) { return fetch(base+path,{ ...init,redirect: 'manual',headers: { connection: 'close',cookie: `maru_session=${token}`,...init.headers } }); }
 function form(overrides: Record<string,string>={}) { return new URLSearchParams({ csrf: autoModProof(token,0),revision: '0',enabled: 'true',words: 'marutestword',timeout: '10m',reason: 'Enable test rule',exempt_role: admin,...overrides }); }
 async function post(body: URLSearchParams | string=form(),headers: Record<string,string>={}) { return request('/automod',{ method: 'POST',body,headers: { origin: base,'content-type': 'application/x-www-form-urlencoded',...headers } }); }
 before(async () => {
-  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql','011_rapid_messages.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
   await new Promise<void>((resolve) => server.listen(0,'127.0.0.1',resolve)); base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
@@ -86,7 +86,7 @@ beforeEach(async () => {
     channels: [{ id: channel,name: 'general' },{ id: logs,name: 'logs' },{ id: otherChannel,name: 'finished-work' }],canDelete: true,canTimeout: true };
   context={ guildName: 'Maru Development',roleIds: [],parentId: null,owner: false,canDelete: true,canTimeout: true,timeoutUntil: null };
   await db.exec('SELECT pg_advisory_unlock_all()');
-  await db.exec('TRUNCATE automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
+  await db.exec('TRUNCATE automod_message_activity,automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
   await query('INSERT INTO guild_settings (guild_id,settings) VALUES ($1,$3::jsonb),($2,$3::jsonb)',[guild,otherGuild,JSON.stringify({ moderation_log_channel_id: logs })]);
   await query("INSERT INTO staff_roles (guild_id,role_id,access_level) VALUES ($1,$2,'admin'),($1,$3,'moderator')",[guild,admin,mod]);
   await query("INSERT INTO dashboard_sessions (token_hash,guild_id,user_id,display_name,expires_at) VALUES ($1,$2,$3,'Staff',NOW()+INTERVAL '1 hour')",[digest(token),guild,actor]);
@@ -368,4 +368,158 @@ test('a previously detected but unremoved message is rechecked against a new ent
   await enqueue(value); await processAutoModJob(pool,guild,deps);
   assert.equal(deletes.length,1); assert.equal((await violations()).length,1); assert.equal((await violations())[0]!.violation_count,1);
   assert.deepEqual((await violations())[0]!.matched_entries,['marutestword']);
+});
+
+async function spamSave(overrides: Record<string,unknown>={}) {
+  await save({ enabled: false,spamEnabled: true,spamLimit: 5,spamWindowSeconds: 5,spamTimeoutSeconds: 600,spamEnforcedRoles: [],spamEnforcedChannels: [],...overrides });
+}
+async function rapid(value=message('ordinary conversation'),at=new Date()) {
+  await enqueueAutoModCandidates(pool,guild,[{ messageId: value.id,channelId: value.channelId,content: value.content,eventAt: at,isCreate: true }]);
+  await processAutoModJob(pool,guild,deps); return value;
+}
+async function burst(n: number,at=new Date()) { for(let i=0;i<n;i++) await rapid(message('ordinary conversation'),at); }
+async function spamViolations() { return (await violations()).filter((v) => v.rule_key==='rapid_messages'); }
+test('rapid messages default Off and reject out-of-range limits, windows and durations', async () => {
+  const initial=await readAutoModSettings(pool,guild); assert.equal(initial.spam_enabled,false); assert.equal(initial.spam_limit,5); assert.equal(initial.spam_window_seconds,5);
+  for(const fields of [{ spamLimit: 1 },{ spamLimit: 51 },{ spamWindowSeconds: 0 },{ spamWindowSeconds: 61 },{ spamTimeoutSeconds: 2419201 },{ spamLimit: 3.5 }]) await assert.rejects(spamSave(fields),/INVALID_SPAM/);
+  assert.equal((await query('SELECT * FROM automod_settings')).rows.length,0);
+});
+test('five human creates are allowed; the sixth and further eligible messages are deleted and logged', async () => {
+  await spamSave(); await burst(5); assert.equal(deletes.length,0); await rapid(); await rapid();
+  assert.equal(deletes.length,2); assert.equal((await spamViolations()).length,2); assert.equal(actions.length,0);
+  const log=sent[0]!; assert.equal(log.embeds![0]!.title,'Rapid-message violation'); assert.deepEqual(log.allowed_mentions,{ parse: [] }); assert.ok(!JSON.stringify(log).includes('ordinary conversation'));
+});
+test('spam uses a configurable rolling window, excludes its left boundary and allows a later quiet message', async () => {
+  await spamSave({ spamLimit: 2,spamWindowSeconds: 2 }); const at=new Date(Date.now()-3000);
+  await rapid(message('first'),at); await rapid(message('second'),at);
+  await rapid(message('boundary'),new Date(at.getTime()+2000)); assert.equal(deletes.length,0);
+  await rapid(message('fourth'),new Date(at.getTime()+2001)); await rapid(message('fifth'),new Date(at.getTime()+2002)); assert.equal(deletes.length,1);
+});
+test('rapid-message counts span eligible channels but not members', async () => {
+  await spamSave({ spamLimit: 2 }); await rapid(); const cross=message('cross channel'); cross.channelId=otherChannel; await rapid(cross);
+  await rapid(message('other member',actor)); assert.equal(deletes.length,0); await rapid(); assert.equal(deletes.length,1);
+});
+test('duplicate creates and edits cannot inflate traffic or repeat deletion and log', async () => {
+  await spamSave({ spamLimit: 2 }); const first=await rapid(); for(let i=0;i<4;i++) await rapid(first); await rapid(); assert.equal(deletes.length,0);
+  const last=await rapid(); assert.equal(deletes.length,1); for(let i=0;i<3;i++) { await enqueue(last); await retry(); }
+  assert.equal((await query('SELECT * FROM automod_message_activity')).rows.length,3); assert.equal(deletes.length,1); assert.equal(sent.length,1);
+});
+test('spam-only content edits are not ingested as new messages', async () => {
+  await spamSave(); for(let i=0;i<10;i++) await enqueue(message('changed content'));
+  assert.equal((await query('SELECT * FROM automod_jobs')).rows.length,0);
+});
+test('ignored channels and roles do not contribute to rapid-message counts; overrides are independent', async () => {
+  await spamSave({ spamLimit: 2,ignoredChannels: [otherChannel] });
+  for(let i=0;i<6;i++) { const m=message('ignored'); m.channelId=otherChannel; await rapid(m); }
+  context.roleIds=[mod]; await burst(6); context.roleIds=[]; await burst(2);
+  assert.equal(deletes.length,0); assert.equal((await query('SELECT * FROM automod_message_activity')).rows.length,2); await rapid(); assert.equal(deletes.length,1);
+});
+test('rapid-message role overrides do not change blocked-word exemptions', async () => {
+  await spamSave({ enabled: true,spamLimit: 2,spamEnforcedRoles: [mod] }); context.roleIds=[mod];
+  await rapid(message()); await rapid(message()); await rapid(message());
+  assert.equal(deletes.length,1); assert.equal((await violations()).length,1); assert.equal((await violations())[0]!.rule_key,'rapid_messages');
+});
+test('rapid-message channel overrides include threads but retain exempt roles', async () => {
+  await spamSave({ spamLimit: 2,ignoredChannels: [otherChannel],spamEnforcedChannels: [otherChannel] }); context.parentId=otherChannel;
+  await burst(3); assert.equal(deletes.length,1); context.roleIds=[mod]; await burst(3); assert.equal(deletes.length,1);
+});
+test('bots webhooks and the guild owner never build rapid-message history', async () => {
+  await spamSave({ spamLimit: 2 }); const b=message(); b.bot=true; await rapid(b); const w=message(); w.webhook=true; await rapid(w);
+  context.owner=true; await burst(4); assert.equal((await query('SELECT * FROM automod_message_activity')).rows.length,0); assert.equal(deletes.length,0);
+});
+test('fifth spam violation times out using its own duration and resets only its own counter', async () => {
+  await spamSave({ enabled: true,spamTimeoutSeconds: 60 }); await run(); await burst(10);
+  assert.equal(actions.length,1); const records=await cases(); assert.equal(records.length,1); assert.equal(records[0]!.duration_seconds,60); assert.match(records[0]!.reason,/rapid-message/);
+  const counters=(await query('SELECT * FROM automod_counters ORDER BY rule_key')).rows as { rule_key: string; reset_at: unknown }[];
+  assert.equal(counters.length,2); const blockedCount=(await query("SELECT count(*)::int AS n FROM automod_violations WHERE rule_key='blocked_words' AND delete_status='removed'")).rows[0] as { n: number }; assert.equal(blockedCount.n,1);
+  assert.equal(sent.at(-1)!.embeds![0]!.fields!.find((f) => f.name==='Timeout result')!.value,'Timeout applied');
+});
+test('one message can violate both rules without duplicate cases or cross-rule log nonces', async () => {
+  await spamSave({ enabled: true,spamLimit: 2 }); await rapid(message()); await rapid(message()); await rapid(message());
+  const last=(await violations()).filter((v) => v.message_id===String(messageId)); assert.equal(last.length,2); assert.equal(deletes.length,3);
+  assert.equal(new Set(sent.map((body) => body.nonce)).size,sent.length); assert.equal(actions.length,0);
+});
+test('a blocked-word timeout does not also apply a spam timeout to an already timed-out member', async () => {
+  await spamSave({ enabled: true,spamLimit: 2 }); for(let i=0;i<7;i++) await rapid(message());
+  assert.equal(actions.length,1); assert.equal((await cases()).length,1); assert.ok((await spamViolations()).length>=5);
+});
+test('rapid-message deletion can recover a lost response without counting or logging twice', async () => {
+  await spamSave({ spamLimit: 2 }); await burst(2); deleteFailure='after'; await rapid(); assert.equal(deletes.length,1); deleteFailure=undefined; await retry();
+  assert.equal(deletes.length,1); assert.equal((await spamViolations()).length,1); assert.equal(sent.length,1);
+});
+test('rapid-message deletion requires fresh permissions and later retries remain idempotent', async () => {
+  await spamSave({ spamLimit: 2 }); await burst(2); context.canDelete=false; await rapid(); assert.equal(deletes.length,0); assert.equal((await spamViolations()).length,0);
+  context.canDelete=true; await retry(); assert.equal(deletes.length,1);
+});
+test('rapid-message timeout response loss stays unconfirmed and is not resent', async () => {
+  await spamSave(); nativeFailure='network'; await burst(10); assert.equal(actions.length,1); await rapid(); assert.equal(actions.length,1);
+  assert.equal((await cases())[0]!.action_status,'unconfirmed');
+});
+test('rapid-message audit failure prevents deletion and retry uses saved traffic evidence', async () => {
+  await spamSave({ spamLimit: 2 }); await burst(2); failAudit='AUTOMOD_RAPID_MESSAGE'; await rapid(); assert.equal(deletes.length,0); assert.equal(sent.length,0);
+  failAudit=undefined; await retry(); assert.equal(deletes.length,1);
+});
+test('settings changes start a fresh traffic window and disable queued spam deletions', async () => {
+  await spamSave({ spamLimit: 2 }); await burst(2);
+  const m=message('queued'); await enqueueAutoModCandidates(pool,guild,[{ messageId: m.id,channelId: channel,content: m.content,eventAt: new Date(),isCreate: true }]);
+  await save({ enabled: false,revision: 1,spamEnabled: false }); await processAutoModJob(pool,guild,deps); assert.equal(deletes.length,0);
+  await save({ enabled: false,revision: 2,spamEnabled: true }); await rapid(); assert.equal(deletes.length,0);
+});
+test('old replayed and future-dated creates do not build spam history or cause punishment', async () => {
+  await spamSave({ spamLimit: 2 }); for(let i=0;i<4;i++) await rapid(message(),new Date(Date.now()-700000)); for(let i=0;i<4;i++) await rapid(message(),new Date(Date.now()+60000));
+  assert.equal(deletes.length,0); assert.equal((await query('SELECT * FROM automod_message_activity')).rows.length,0);
+});
+test('rapid-message settings require Admin access, permissions and logging even when blocked words are Off', async () => {
+  resources.canTimeout=false; await assert.rejects(spamSave(),/BOT_PERMISSIONS/); resources.canTimeout=true;
+  roles=[mod]; await assert.rejects(spamSave(),/ADMIN_REQUIRED/); roles=[admin]; await query("UPDATE guild_settings SET settings='{}'"); await assert.rejects(spamSave(),/LOG_REQUIRED/);
+});
+test('HTTP spam settings save atomically, render on refresh and reject duplicate or incomplete inputs', async () => {
+  const fields={ spam_enabled: 'true',spam_limit: '4',spam_window: '8',spam_timeout: '1m' };
+  assert.equal((await post(form(fields))).status,303); const saved=await readAutoModSettings(pool,guild); assert.equal(saved.spam_limit,4); assert.equal(saved.spam_window_seconds,8); assert.equal(saved.spam_timeout_seconds,60);
+  const html=await (await request('/automod')).text(); assert.match(html,/Enable rapid-message filtering/); assert.match(html,/Rapid messages: On/);
+  assert.equal((await post(form({ revision: '1',csrf: autoModProof(token,1),...fields,spam_limit: '99' }))).status,400);
+  const duplicate=form({ revision: '1',csrf: autoModProof(token,1),...fields }); duplicate.append('spam_limit','5'); assert.equal((await post(duplicate)).status,400);
+  assert.equal((await post(form({ revision: '1',csrf: autoModProof(token,1),spam_enabled: 'true' }))).status,400);
+});
+test('HTTP rejects legacy open forms when spam is enabled and enforces current session and origin', async () => {
+  await spamSave(); assert.equal((await post(form({ revision: '1',csrf: autoModProof(token,1) }))).status,409);
+  assert.equal((await post(form({ spam_enabled: 'true',spam_limit: '5',spam_window: '5',spam_timeout: '1m' }),{ origin: 'null' })).status,403);
+});
+test('an unresolved blocked-word timeout also blocks native timeout dispatch from the spam rule', async () => {
+  await spamSave({ enabled: true,spamLimit: 2 }); nativeFailure='network'; for(let i=0;i<7;i++) await rapid(message());
+  assert.equal(actions.length,1); assert.equal((await cases()).length,1); assert.match(String((await spamViolations()).at(-1)!.timeout_note),/unresolved timeout/);
+});
+test('changing rate settings cancels an undispatched spam violation from the previous revision', async () => {
+  await spamSave({ spamLimit: 2 }); await burst(2); deleteFailure='before'; await rapid(); assert.equal((await spamViolations()).length,1); const attempted=deletes.length;
+  deleteFailure=undefined; await save({ enabled: false,revision: 1,spamLimit: 20 }); await retry(); assert.equal(deletes.length,attempted); assert.equal(actions.length,0);
+});
+test('persisted rate evidence survives a blocked-word deletion and failed spam audit before retry', async () => {
+  await spamSave({ enabled: true,spamLimit: 2 }); await rapid(message()); await rapid(message()); failAudit='AUTOMOD_RAPID_MESSAGE';
+  const value=await rapid(message()); assert.equal(messages.has(value.id),false); failAudit=undefined; await retry();
+  assert.equal((await spamViolations()).length,1); assert.equal(deletes.length,3); assert.equal(sent.length,4);
+});
+test('a create followed by a matching edit retains its creation time for traffic and edit time for blocked words', async () => {
+  await spamSave({ enabled: true,spamLimit: 2 }); const value=message('ordinary'); const created=new Date(Date.now()-1000),edited=new Date();
+  await enqueueAutoModCandidates(pool,guild,[{ messageId: value.id,channelId: channel,content: value.content,eventAt: created,isCreate: true }]);
+  value.content='marutestword'; await enqueueAutoModCandidates(pool,guild,[{ messageId: value.id,channelId: channel,content: value.content,eventAt: edited,isCreate: false }]);
+  await processAutoModJob(pool,guild,deps);
+  const observation=(await query('SELECT occurred_at FROM automod_message_activity')).rows[0] as { occurred_at: Date };
+  assert.equal(new Date(observation.occurred_at).getTime(),created.getTime()); assert.equal(new Date((await violations())[0]!.occurred_at as string).getTime(),edited.getTime());
+});
+test('spam overrides require global selection and full-access grants still require current staff roles', async () => {
+  await assert.rejects(spamSave({ spamEnforcedRoles: [community] }),/INVALID_SELECTION/);
+  await assert.rejects(spamSave({ spamEnforcedChannels: [channel] }),/INVALID_SELECTION/);
+  roles=[]; await assert.rejects(spamSave(),/ADMIN_REQUIRED/);
+});
+test('unprocessed creates cannot enter a newer settings revision after a limit change', async () => {
+  await spamSave({ spamLimit: 2 }); const at=new Date();
+  for(let i=0;i<5;i++) { const v=message('queued'); await enqueueAutoModCandidates(pool,guild,[{ messageId: v.id,channelId: channel,content: v.content,eventAt: at,isCreate: true }]); }
+  await save({ enabled: false,revision: 1,spamTimeoutSeconds: 60 }); while(await processAutoModJob(pool,guild,deps)) { /* drain */ }
+  assert.equal(deletes.length,0); assert.equal((await query('SELECT * FROM automod_message_activity')).rows.length,0);
+});
+test('creates queued while spam is Off cannot count when the rule is enabled before processing', async () => {
+  await save(); const at=new Date();
+  for(let i=0;i<5;i++) { const v=message(); await enqueueAutoModCandidates(pool,guild,[{ messageId: v.id,channelId: channel,content: v.content,eventAt: at,isCreate: true }]); }
+  await save({ enabled: false,revision: 1,spamEnabled: true,spamLimit: 2 }); while(await processAutoModJob(pool,guild,deps)) { /* drain */ }
+  assert.equal(deletes.length,0); assert.equal((await query('SELECT * FROM automod_message_activity')).rows.length,0);
 });
