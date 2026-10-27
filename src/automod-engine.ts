@@ -5,15 +5,18 @@ import { AutoModError, autoModExempt, readAutoModSettings } from './automod-sett
 import type { AutoModSettings } from './automod-settings.js';
 import { matchBlockedWords } from './blocked-words.js';
 import { observeRapidMessage, rapidMessageMatch, readRapidSource } from './rapid-messages.js';
+import { observeRepeatedMessage, repeatedMessageMatch, repeatedDecision, readRepeatedSource } from './repeated-messages.js';
+import type { AutoModImage, ImageFingerprints } from './image-fingerprints.js';
 import { digest } from './web-security.js';
 import { logChannelId } from './server-settings.js';
 import type { WarningCase } from './warnings.js';
 
-export type AutoModMessage = { id: string; channelId: string; userId: string; content: string; bot: boolean; webhook: boolean };
+export type AutoModMessage = { images?: AutoModImage[]; repeatHistorical?: boolean; id: string; channelId: string; userId: string; content: string; bot: boolean; webhook: boolean };
 export type AutoModContext = { guildName: string; roleIds: string[]; parentId: string | null; owner: boolean; canDelete: boolean; canTimeout: boolean; timeoutUntil: string | null };
-export type AutoModRule = 'blocked_words'|'rapid_messages';
-export type AutoModJob = { is_create?: boolean; created_at?: Date | null; spam_revision?: number | null; guild_id: string; message_id: string; channel_id: string; event_at: Date; version: string; attempts: number };
+export type AutoModRule = 'blocked_words'|'rapid_messages'|'repeated_messages';
+export type AutoModJob = { is_create?: boolean; created_at?: Date | null; spam_revision?: number | null; repeat_revision?: number | null; guild_id: string; message_id: string; channel_id: string; event_at: Date; version: string; attempts: number };
 export type AutoModDependencies = {
+  imageFingerprints?: (message: AutoModMessage) => Promise<ImageFingerprints>;
   botId: () => string;
   readMessage: (channel: string,message: string) => Promise<AutoModMessage | null>;
   readContext: (channel: string,userId: string) => Promise<AutoModContext>;
@@ -28,18 +31,23 @@ type Counter = { reset_at: Date; last_attempt_at: Date | null; pending_case_numb
 export async function processAutoModMessage(client: PoolClient,job: AutoModJob,deps: AutoModDependencies): Promise<void> {
   const config=await readAutoModSettings(client,job.guild_id);
   // Observe before blocked-word deletion so one message can independently violate both rules.
-  const source=config.spam_enabled?await deps.readMessage(job.channel_id,job.message_id):undefined;
+  const source=(config.spam_enabled || config.repeat_enabled)?await deps.readMessage(job.channel_id,job.message_id):undefined;
   if(config.spam_enabled && source && job.is_create && !source.bot && !source.webhook && source.userId!==deps.botId()) {
     const context=await deps.readContext(job.channel_id,source.userId);
     if(!context.owner && !autoModExempt(config,context.roleIds,job.channel_id,context.parentId,'rapid_messages')) await observeRapidMessage(client,job,source,config);
   }
+  if(config.repeat_enabled && source && job.is_create && !source.bot && !source.webhook && source.userId!==deps.botId()) {
+    const context=await deps.readContext(job.channel_id,source.userId);
+    if(!context.owner && !autoModExempt(config,context.roleIds,job.channel_id,context.parentId,'repeated_messages')) await observeRepeatedMessage(client,job,source,config,deps);
+  }
   await processRule(client,job,deps,'blocked_words',source);
   await processRule(client,{ ...job,event_at: job.created_at ?? job.event_at },deps,'rapid_messages',source ?? await readRapidSource(client,job));
+  await processRule(client,{ ...job,event_at: job.created_at ?? job.event_at },deps,'repeated_messages',source ?? await readRepeatedSource(client,job));
 }
 async function processRule(client: PoolClient,job: AutoModJob,deps: AutoModDependencies,rule: AutoModRule,snapshot?: AutoModMessage | null): Promise<void> {
   const guild=job.guild_id; const config=await readAutoModSettings(client,guild);
-  const enabled=rule==='blocked_words'?config.blocked_enabled:!!config.spam_enabled;
-  const matches=async (source: AutoModMessage) => rule==='blocked_words'?matchBlockedWords(source.content,config.blocked_words):rapidMessageMatch(client,job,source,config);
+  const enabled=rule==='repeated_messages'?!!config.repeat_enabled:rule==='blocked_words'?config.blocked_enabled:!!config.spam_enabled;
+  const matches=async (source: AutoModMessage) => rule==='repeated_messages'?repeatedMessageMatch(client,job,source,config,deps):rule==='blocked_words'?matchBlockedWords(source.content,config.blocked_words):rapidMessageMatch(client,job,source,config);
   let violation=(await client.query<Violation>(`SELECT * FROM automod_violations WHERE guild_id=$1 AND rule_key='${rule}' AND message_id=$2`,[guild,job.message_id])).rows[0];
   let context: AutoModContext | undefined;
   async function audit(event: string,details: Record<string,unknown>) {
@@ -60,7 +68,7 @@ async function processRule(client: PoolClient,job: AutoModJob,deps: AutoModDepen
       if (!settings) throw new AutoModError('NOT_CONFIGURED');
       violation=(await client.query<Violation>(`INSERT INTO automod_violations (rule_key,guild_id,message_id,channel_id,parent_channel_id,user_id,occurred_at,matched_entries,log_channel_id,log_status)
         VALUES ('${rule}',$1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[guild,job.message_id,job.channel_id,context!.parentId,source.userId,job.event_at,matched,logChannelId(settings.settings),logChannelId(settings.settings)?'pending':'not_configured'])).rows[0]!;
-      await audit(rule==='blocked_words'?'AUTOMOD_BLOCKED_WORD':'AUTOMOD_RAPID_MESSAGE',{ matched_entries: matched,channel_id: job.channel_id,reason: 'Detected an automatic moderation violation; source content was not copied into the audit.' });
+      await audit(rule==='repeated_messages'?'AUTOMOD_REPEATED_MESSAGE':rule==='blocked_words'?'AUTOMOD_BLOCKED_WORD':'AUTOMOD_RAPID_MESSAGE',{ matched_entries: matched,channel_id: job.channel_id,reason: 'Detected an automatic moderation violation; source content was not copied into the audit.' });
     });
   }
   if (!violation) return;
@@ -79,7 +87,7 @@ async function processRule(client: PoolClient,job: AutoModJob,deps: AutoModDepen
       }
     }
   }
-  const active=enabled && (rule==='rapid_messages'?(await rapidMessageMatch(client,job,{ id: v.message_id,channelId: v.channel_id,userId: v.user_id,content: '',bot: false,webhook: false },config)).length>0:v.matched_entries.some((entry) => config.blocked_words.includes(entry))) && !context.owner &&
+  const active=enabled && (rule==='repeated_messages'?(await repeatedDecision(client,job,config)).length>0:rule==='rapid_messages'?(await rapidMessageMatch(client,job,{ id: v.message_id,channelId: v.channel_id,userId: v.user_id,content: '',bot: false,webhook: false },config)).length>0:v.matched_entries.some((entry) => config.blocked_words.includes(entry))) && !context.owner &&
     !autoModExempt(config,context.roleIds,v.channel_id,context.parentId ?? v.parent_channel_id,rule);
   if (active) {
     if (v.delete_status!=='removed') {
@@ -178,15 +186,15 @@ async function timeoutForViolation(client: PoolClient,v: Violation,settings: Aut
         record=(await client.query<WarningCase>(`INSERT INTO moderation_cases (guild_id,case_number,request_id,action,actor_id,target_user_id,reason,guild_name,
           log_channel_id,log_status,dm_status,action_status,duration_seconds,requested_until,origin)
           VALUES ($1,$2,$3,'timeout',$4,$5,$6,$7,$8,$9,'skipped','pending',$10,$11,'automod') RETURNING *`,
-          [v.guild_id,counterRow.last_case_number,rule==='rapid_messages'?`rapid:${v.message_id}`:v.message_id,deps.botId(),v.user_id,`AutoMod: five ${rule==='rapid_messages'?'rapid-message':'blocked-word'} violations within a rolling ten-minute window.`,context.guildName.slice(0,100),
-            v.log_channel_id,v.log_channel_id?'pending':'not_configured',(rule==='rapid_messages'?settings.spam_timeout_seconds ?? 600:settings.timeout_seconds),new Date(Date.now()+(rule==='rapid_messages'?settings.spam_timeout_seconds ?? 600:settings.timeout_seconds)*1000)])).rows[0]!;
+          [v.guild_id,counterRow.last_case_number,rule==='repeated_messages'?`repeat:${v.message_id}`:rule==='rapid_messages'?`rapid:${v.message_id}`:v.message_id,deps.botId(),v.user_id,`AutoMod: five ${rule==='repeated_messages'?'repeated-message':rule==='rapid_messages'?'rapid-message':'blocked-word'} violations within a rolling ten-minute window.`,context.guildName.slice(0,100),
+            v.log_channel_id,v.log_channel_id?'pending':'not_configured',(rule==='repeated_messages'?settings.repeat_timeout_seconds ?? 600:rule==='rapid_messages'?settings.spam_timeout_seconds ?? 600:settings.timeout_seconds),new Date(Date.now()+(rule==='repeated_messages'?settings.repeat_timeout_seconds ?? 600:rule==='rapid_messages'?settings.spam_timeout_seconds ?? 600:settings.timeout_seconds)*1000)])).rows[0]!;
         await client.query(`UPDATE automod_violations SET case_number=$3 WHERE guild_id=$1 AND rule_key='${rule}' AND message_id=$2`,[v.guild_id,v.message_id,record.case_number]); v.case_number=record.case_number;
         await client.query(`UPDATE automod_counters SET pending_case_number=$3,last_attempt_at=NOW() WHERE guild_id=$1 AND rule_key='${rule}' AND user_id=$2`,[v.guild_id,v.user_id,record.case_number]);
         await client.query("INSERT INTO audit_events (guild_id,actor_id,event_type,details) VALUES ($1,$2,'AUTOMOD_TIMEOUT_REQUESTED',$3::jsonb)",[v.guild_id,deps.botId(),JSON.stringify({ case_number: record.case_number,target_user_id: v.user_id,rule_key: rule,reason: record.reason })]);
         await client.query('COMMIT');
       } catch(error) { await client.query('ROLLBACK'); throw error; }
     }
-    if(record.duration_seconds!==(rule==='rapid_messages'?settings.spam_timeout_seconds ?? 600:settings.timeout_seconds) || new Date(record.requested_until!).getTime()<=Date.now()) { await outcome(record,'rejected','RULE_CHANGED_OR_REQUEST_EXPIRED'); return; }
+    if(record.duration_seconds!==(rule==='repeated_messages'?settings.repeat_timeout_seconds ?? 600:rule==='rapid_messages'?settings.spam_timeout_seconds ?? 600:settings.timeout_seconds) || new Date(record.requested_until!).getTime()<=Date.now()) { await outcome(record,'rejected','RULE_CHANGED_OR_REQUEST_EXPIRED'); return; }
     const claim=await client.query("UPDATE moderation_cases SET action_status='applying',action_attempted_at=NOW() WHERE guild_id=$1 AND case_number=$2 AND action_status='pending' RETURNING case_number",[v.guild_id,record.case_number]);
     if(!claim.rowCount) throw new AutoModError('TIMEOUT_CLAIM_UNAVAILABLE');
     let status: 'applied'|'rejected'|'unconfirmed'='unconfirmed',code: string | null=null;
@@ -209,7 +217,7 @@ async function logViolation(client: PoolClient,old: Violation,deps: AutoModDepen
   if(!claim.rowCount) return;
   if(v.case_number) await client.query("UPDATE moderation_cases SET notification_claimed_at=NOW(),log_status='sending' WHERE guild_id=$1 AND case_number=$2",[v.guild_id,v.case_number]);
   const body: RESTPostAPIChannelMessageJSONBody={ allowed_mentions: { parse: [] },nonce: digest(rule==='blocked_words'?`automod:${v.guild_id}:${v.message_id}`:`automod:${rule}:${v.guild_id}:${v.message_id}`).slice(0,25),enforce_nonce: true,
-    embeds: [{ title: rule==='rapid_messages'?'Rapid-message violation':'Blocked-word violation',color: 0xe6ad73,description: 'Recorded automatic moderation results; the original message content is not copied here.',fields: [
+    embeds: [{ title: rule==='repeated_messages'?'Repeated-message violation':rule==='rapid_messages'?'Rapid-message violation':'Blocked-word violation',color: 0xe6ad73,description: 'Recorded automatic moderation results; the original message content is not copied here.',fields: [
       { name: 'Member ID',value: v.user_id },{ name: 'Channel ID',value: v.channel_id },{ name: 'Message ID',value: v.message_id },
       { name: 'Matched entries',value: v.matched_entries.map((entry) => escapeMarkdown(entry)).join(', ').slice(0,1000) },
       { name: 'Message removal',value: v.delete_status==='removed'?'Confirmed removed':'Not confirmed' },

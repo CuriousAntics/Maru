@@ -13,7 +13,10 @@ import type { AutoModResources } from '../src/automod-settings.js';
 import { matchBlockedWords, parseBlockedWords } from '../src/blocked-words.js';
 import { enqueueAutoModCandidates, parseAutoModEvent, processAutoModJob } from '../src/automod-worker.js';
 import type { AutoModContext, AutoModDependencies, AutoModMessage } from '../src/automod-engine.js';
-import { autoModDependencies } from '../src/automod-discord.js';
+import { autoModDependencies, imageUploads } from '../src/automod-discord.js';
+import { createImageFingerprinter, trustedImageUrl, imageByteLimit, messageImageByteLimit } from '../src/image-fingerprints.js';
+import type { AutoModImage } from '../src/image-fingerprints.js';
+import { repeatedTextKey } from '../src/repeated-messages.js';
 import { caseSummary } from '../src/handle-warning.js';
 import type { WarningCase } from '../src/warnings.js';
 
@@ -43,13 +46,15 @@ function settings(overrides: Record<string,unknown>={}) {
     exemptRoles: [admin,mod],ignoredChannels: [],enforcedRoles: [],enforcedChannels: [],reason: 'Configure development filter',readRoles,readResources,...overrides };
 }
 async function save(overrides: Record<string,unknown>={}) { return saveAutoModSettings(pool,settings(overrides)); }
+let imageData=new Map<string,Uint8Array>(),imageRequests: string[]=[];
+let fingerprintImages=createImageFingerprinter();
 let context: AutoModContext;
 let messages: Map<string,AutoModMessage>;
 let nativeFailure: 'network'|'forbidden'|'after'|undefined,logFailure: 'network'|'forbidden'|undefined;
 let deleteFailure: 'before'|'after'|undefined;
 let actions: { user: string; until: string; number: number }[],sent: RESTPostAPIChannelMessageJSONBody[],deletes: string[];
 let contextHook: (() => Promise<void>) | undefined;
-const deps: AutoModDependencies={ botId: () => bot,
+const deps: AutoModDependencies={ imageFingerprints: async (value) => fingerprintImages(value),botId: () => bot,
   readMessage: async (_channel,id) => messages.get(id) ?? null,
   readContext: async () => { await contextHook?.(); return { ...context }; },
   deleteMessage: async (_channel,id) => { assert.equal(transaction,false); deletes.push(id); if(deleteFailure==='before') throw new Error('delete network failure'); messages.delete(id); if(deleteFailure==='after') throw new Error('delete response lost'); },
@@ -77,17 +82,18 @@ async function request(path: string,init: RequestInit={}) { return fetch(base+pa
 function form(overrides: Record<string,string>={}) { return new URLSearchParams({ csrf: autoModProof(token,0),revision: '0',enabled: 'true',words: 'marutestword',timeout: '10m',reason: 'Enable test rule',exempt_role: admin,...overrides }); }
 async function post(body: URLSearchParams | string=form(),headers: Record<string,string>={}) { return request('/automod',{ method: 'POST',body,headers: { origin: base,'content-type': 'application/x-www-form-urlencoded',...headers } }); }
 before(async () => {
-  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql','011_rapid_messages.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql','011_rapid_messages.sql','012_repeated_messages.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
   await new Promise<void>((resolve) => server.listen(0,'127.0.0.1',resolve)); base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
   connectHook=undefined; failAudit=undefined; failClaim=busy=failUnlock=discarded=transaction=false; readHook=contextHook=undefined;
+  imageData=new Map(); imageRequests=[]; fingerprintImages=createImageFingerprinter((async (url) => { const address=String(url); imageRequests.push(address); const bytes=imageData.get(new URL(address).pathname.split('/')[3]!); if(!bytes) throw new Error('Image unavailable'); return new Response(Buffer.from(bytes)); }) as typeof fetch);
   nativeFailure=logFailure=deleteFailure=undefined; actions=[]; sent=[]; deletes=[]; messages=new Map(); token=randomToken(); roles=[admin]; ready=true;
   resources={ roles: [{ id: admin,name: 'Admin' },{ id: mod,name: 'Mods' },{ id: community,name: 'Community Manager' }],
     channels: [{ id: channel,name: 'general' },{ id: logs,name: 'logs' },{ id: otherChannel,name: 'finished-work' }],canDelete: true,canTimeout: true };
   context={ guildName: 'Maru Development',roleIds: [],parentId: null,owner: false,canDelete: true,canTimeout: true,timeoutUntil: null };
   await db.exec('SELECT pg_advisory_unlock_all()');
-  await db.exec('TRUNCATE automod_message_activity,automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
+  await db.exec('TRUNCATE automod_repeat_activity,automod_message_activity,automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
   await query('INSERT INTO guild_settings (guild_id,settings) VALUES ($1,$3::jsonb),($2,$3::jsonb)',[guild,otherGuild,JSON.stringify({ moderation_log_channel_id: logs })]);
   await query("INSERT INTO staff_roles (guild_id,role_id,access_level) VALUES ($1,$2,'admin'),($1,$3,'moderator')",[guild,admin,mod]);
   await query("INSERT INTO dashboard_sessions (token_hash,guild_id,user_id,display_name,expires_at) VALUES ($1,$2,$3,'Staff',NOW()+INTERVAL '1 hour')",[digest(token),guild,actor]);
@@ -529,15 +535,16 @@ function sectionForm(section: string,revision=0,overrides: Record<string,string>
   const defaults: Record<string,Record<string,string>>={ blocked_words: { enabled: 'true',words: 'newword, another phrase',timeout: '2m' },rapid_messages: { spam_enabled: 'true',spam_limit: '3',spam_window: '8',spam_timeout: '1m' },exemptions: { exempt_role: admin,ignored_channel: otherChannel } };
   return new URLSearchParams({ section,revision: String(revision),csrf: autoModSectionProof(token,revision,section),reason: 'Save this section',...defaults[section],...overrides });
 }
-test('AutoMod renders three independent forms with distinct save buttons and section proofs', async () => {
+test('AutoMod renders four independent forms with distinct save buttons and section proofs', async () => {
   const html=await (await request('/automod')).text(); const forms=[...html.matchAll(/<form method="post" action="\/automod">([\s\S]*?)<\/form>/g)].map((match) => match[1]!);
-  assert.equal(forms.length,3);
-  for(const [index,section] of ['blocked_words','rapid_messages','exemptions'].entries()) {
+  assert.equal(forms.length,4);
+  for(const [index,section] of ['blocked_words','rapid_messages','repeated_messages','exemptions'].entries()) {
     assert.ok(forms[index]!.includes(`name="section" value="${section}"`)); assert.ok(forms[index]!.includes(autoModSectionProof(token,0,section))); assert.ok(forms[index]!.includes('name="reason"'));
   }
   assert.match(forms[0]!,/Save blocked words/); assert.ok(!forms[0]!.includes('name="spam_limit"')); assert.ok(!forms[0]!.includes('name="exempt_role"'));
   assert.match(forms[1]!,/Save rapid messaging/); assert.ok(!forms[1]!.includes('name="words"'));
-  assert.match(forms[2]!,/Save shared exemptions/); assert.ok(!forms[2]!.includes('name="enabled"'));
+  assert.match(forms[2]!,/Save repeated messages/); assert.ok(!forms[2]!.includes('name="words"'));
+  assert.match(forms[3]!,/Save shared exemptions/); assert.ok(!forms[3]!.includes('name="enabled"'));
 });
 test('saving blocked words preserves every rapid-message setting and shared exemption', async () => {
   await spamSave({ enabled: true,spamLimit: 7,spamWindowSeconds: 12,spamTimeoutSeconds: 120,ignoredChannels: [otherChannel],spamEnforcedRoles: [mod],spamEnforcedChannels: [otherChannel] });
@@ -598,4 +605,163 @@ test('a no-op section save does not advance revision or duplicate an audit entry
   assert.equal((await post(sectionForm('blocked_words'))).status,303);
   assert.equal((await post(sectionForm('blocked_words',1))).status,303); assert.equal((await readAutoModSettings(pool,guild)).revision,1);
   assert.equal((await query("SELECT * FROM audit_events WHERE event_type='AUTOMOD_SETTINGS_CHANGED'")).rows.length,1);
+});
+
+async function repeatSave(overrides: Record<string,unknown>={}) { await save({ enabled: false,repeatEnabled: true,repeatText: true,repeatImages: true,repeatLimit: 3,repeatWindowSeconds: 30,repeatTimeoutSeconds: 600,repeatEnforcedRoles: [],repeatEnforcedChannels: [],...overrides }); }
+let attachmentId=900000000000000000n;
+const imageBytes=Uint8Array.from([137,80,78,71,13,10,26,10,1,2,3,4]);
+function imageMessage(caption='',bytes=imageBytes,name='upload.png',user=member,where=channel) {
+  const value=message(caption,user); value.channelId=where;
+  const id=String(++attachmentId); imageData.set(id,bytes);
+  const result=value as AutoModMessage; result.images=[{ id,url: `https://cdn.discordapp.com/attachments/${where}/${id}/${name}?ex=abc&is=def&hm=signed`,size: bytes.length }]; return result;
+}
+function repeatForm(revision=0,overrides: Record<string,string>={}) { return new URLSearchParams({ section: 'repeated_messages',revision: String(revision),csrf: autoModSectionProof(token,revision,'repeated_messages'),reason: 'Configure repetition filtering',repeat_enabled: 'true',repeat_text: 'true',repeat_images: 'true',repeat_limit: '3',repeat_window: '30',repeat_timeout: '1m',...overrides }); }
+async function repeatViolations() { return (await violations()).filter((v) => v.rule_key==='repeated_messages'); }
+test('repetition defaults Off with text and images selected and validates limits and modes', async () => {
+  const config=await readAutoModSettings(pool,guild); assert.equal(config.repeat_enabled,false); assert.equal(config.repeat_text,true); assert.equal(config.repeat_images,true); assert.equal(config.repeat_limit,3); assert.equal(config.repeat_window_seconds,30);
+  for(const fields of [{ repeatLimit: 1 },{ repeatLimit: 51 },{ repeatWindowSeconds: 0 },{ repeatWindowSeconds: 301 },{ repeatTimeoutSeconds: 2419201 },{ repeatText: false,repeatImages: false }]) await assert.rejects(repeatSave(fields),/INVALID_REPEAT/);
+});
+test('third identical text matches capitalization and repeated whitespace while earlier messages stay', async () => {
+  await repeatSave(); await rapid(message('Hello    world')); await rapid(message('hello\nworld')); assert.equal(deletes.length,0); await rapid(message('HELLO WORLD'));
+  assert.equal(deletes.length,1); assert.equal((await repeatViolations()).length,1); assert.equal(sent[0]!.embeds![0]!.title,'Repeated-message violation');
+  assert.ok(!JSON.stringify(sent).includes('hello world')); assert.equal(repeatedTextKey('  '),null); assert.equal(repeatedTextKey('A B'),repeatedTextKey('a   b'));
+});
+test('third identical file matches reuploads with different attachment IDs filenames and captions', async () => {
+  await repeatSave(); await rapid(imageMessage('caption one',imageBytes,'one.png')); await rapid(imageMessage('caption two',imageBytes,'renamed.png')); assert.equal(deletes.length,0);
+  await rapid(imageMessage('caption three',imageBytes,'another.png')); assert.equal(deletes.length,1); assert.equal((await repeatViolations()).length,1);
+  assert.match(String((await repeatViolations())[0]!.matched_entries),/Identical image: 3/); assert.equal(imageRequests.length,3);
+});
+test('same filenames and sizes with different bytes do not count as identical images', async () => {
+  await repeatSave(); for(let i=0;i<3;i++) await rapid(imageMessage('',Uint8Array.from([1,2,i]),'same.png')); assert.equal(deletes.length,0); assert.equal((await repeatViolations()).length,0);
+});
+test('many copies of a file in one message count as one occurrence and one removed message is one violation', async () => {
+  await repeatSave(); const first=imageMessage(); first.images!.push(first.images![0]!,first.images![0]!); await rapid(first); assert.equal(deletes.length,0);
+  await rapid(imageMessage()); const third=imageMessage(); third.images!.push(third.images![0]!); await rapid(third);
+  assert.equal(deletes.length,1); assert.equal((await repeatViolations()).length,1); assert.equal((await repeatViolations())[0]!.violation_count,1);
+});
+test('matching text and several matching image files in one message still count once', async () => {
+  await repeatSave();
+  for(let i=0;i<3;i++) { const value=imageMessage('same caption'); const another=imageMessage('',Uint8Array.from([4,5,6])); value.images!.push(another.images![0]!); await rapid(value); }
+  const recorded=await repeatViolations(); assert.equal(recorded.length,1); assert.equal(recorded[0]!.violation_count,1); assert.equal((recorded[0]!.matched_entries as string[]).length,3); assert.equal(deletes.length,1);
+});
+test('text-only mode performs no image downloads and image-only mode ignores repeated captions', async () => {
+  await repeatSave({ repeatImages: false }); for(let i=0;i<3;i++) await rapid(imageMessage('same')); assert.equal(deletes.length,1); assert.equal(imageRequests.length,0);
+  await save({ enabled: false,revision: 1,repeatText: false,repeatImages: true }); const before=deletes.length;
+  for(let i=0;i<3;i++) await rapid(imageMessage('same',Uint8Array.from([9,i]))); assert.equal(deletes.length,before);
+});
+test('repetition spans eligible channels but remains per member and uses an exclusive window boundary', async () => {
+  await repeatSave({ repeatLimit: 2,repeatWindowSeconds: 2 }); const at=new Date();
+  await rapid(imageMessage('',imageBytes,'one.png',member,channel),at); await rapid(imageMessage('',imageBytes,'two.png',actor,otherChannel),at); assert.equal(deletes.length,0);
+  await rapid(imageMessage('',imageBytes,'three.png',member,otherChannel),new Date(at.getTime()+1)); assert.equal(deletes.length,1);
+  await rapid(imageMessage('',imageBytes,'four.png',member,channel),new Date(at.getTime()+2001)); assert.equal(deletes.length,1);
+});
+test('five repeated-message violations trigger one timeout with a separate counter and the configured duration', async () => {
+  await repeatSave({ repeatTimeoutSeconds: 60 }); const at=new Date(); for(let i=0;i<7;i++) await rapid(imageMessage(),at);
+  assert.equal(deletes.length,5); assert.equal(actions.length,1); const record=(await cases())[0]!; assert.equal(record.duration_seconds,60); assert.equal(record.origin,'automod'); assert.equal(record.dm_status,'skipped'); assert.match(record.reason,/repeated-message/);
+  assert.deepEqual(sent.at(-1)!.allowed_mentions,{ parse: [] }); assert.equal((await repeatViolations()).at(-1)!.violation_count,5);
+});
+test('duplicate creates and content edits cannot inflate repetition history or repeat actions', async () => {
+  await repeatSave(); const first=await rapid(imageMessage()); for(let i=0;i<4;i++) await rapid(first); await rapid(imageMessage()); assert.equal(deletes.length,0);
+  const third=await rapid(imageMessage()); for(let i=0;i<3;i++) { await enqueue(third); await retry(); }
+  assert.equal(deletes.length,1); assert.equal(sent.length,1); assert.equal((await query('SELECT * FROM automod_repeat_activity')).rows.length,3);
+});
+test('exempt members ignored channels thread parents bots and owner do not enter repetition history or download images', async () => {
+  await repeatSave({ ignoredChannels: [otherChannel] }); context.roleIds=[mod]; await rapid(imageMessage()); context.roleIds=[]; context.parentId=otherChannel; await rapid(imageMessage()); context.parentId=null;
+  const ignored=imageMessage('',imageBytes,'x.png',member,otherChannel); await rapid(ignored); const botMessage=imageMessage(); botMessage.bot=true; await rapid(botMessage); context.owner=true; await rapid(imageMessage());
+  assert.equal(imageRequests.length,0); assert.equal((await query('SELECT * FROM automod_repeat_activity')).rows.length,0);
+});
+test('repetition rule overrides are separate and do not bypass an ignored channel', async () => {
+  await repeatSave({ repeatLimit: 2,repeatEnforcedRoles: [mod],ignoredChannels: [otherChannel] }); context.roleIds=[mod]; await rapid(imageMessage()); await rapid(imageMessage()); assert.equal(deletes.length,1);
+  await rapid(imageMessage('',imageBytes,'ignored.png',member,otherChannel)); assert.equal(deletes.length,1);
+});
+test('missing image bytes are skipped rather than treated as matches and the dashboard reports incomplete checks', async () => {
+  await repeatSave(); for(let i=0;i<3;i++) { const value=imageMessage(); imageData.delete(value.images![0]!.id); await rapid(value); }
+  assert.equal(deletes.length,0); const html=await (await request('/automod')).text(); assert.match(html,/3 message\(s\) in the last hour had images/);
+  assert.equal((await query("SELECT * FROM automod_repeat_activity WHERE image_status='partly_skipped'")).rows.length,3);
+});
+test('unavailable images do not prevent text repetition checks', async () => {
+  await repeatSave(); for(let i=0;i<3;i++) { const value=imageMessage('same words'); imageData.delete(value.images![0]!.id); await rapid(value); }
+  assert.equal(deletes.length,1); assert.match(String((await repeatViolations())[0]!.matched_entries),/Repeated text/);
+});
+test('image links without uploaded attachments do not download remote URLs', async () => {
+  await repeatSave({ repeatText: false }); for(let i=0;i<3;i++) await rapid(message('https://untrusted.example/same.png')); assert.equal(imageRequests.length,0); assert.equal(deletes.length,0);
+});
+test('an attachment removed before dispatch avoids a stale image deletion', async () => {
+  await repeatSave(); await rapid(imageMessage()); await rapid(imageMessage()); const last=imageMessage(); let reads=0;
+  contextHook=async () => { if(++reads===2) last.images=[]; }; await rapid(last); assert.equal(deletes.length,0); assert.equal(actions.length,0);
+});
+test('saved file fingerprints survive a blocked-word deletion and failed repetition audit without retaining files', async () => {
+  await repeatSave({ enabled: true,repeatLimit: 2 }); await rapid(imageMessage('marutestword')); failAudit='AUTOMOD_REPEATED_MESSAGE'; const last=await rapid(imageMessage('marutestword')); failAudit=undefined; imageData.clear(); await retry();
+  assert.equal(messages.has(last.id),false); assert.equal((await repeatViolations()).length,1); assert.equal(deletes.length,2);
+  const stored=JSON.stringify((await query('SELECT * FROM automod_repeat_activity')).rows); assert.ok(!stored.includes('marutestword')); assert.ok(!stored.includes('cdn.discordapp.com')); assert.ok(!stored.includes('signed'));
+});
+test('repetition timeout response loss is unconfirmed and never blindly resent', async () => {
+  await repeatSave(); nativeFailure='network'; const at=new Date(); for(let i=0;i<8;i++) await rapid(message('same'),at); assert.equal(actions.length,1); assert.equal((await cases())[0]!.action_status,'unconfirmed');
+});
+test('queued creates and earlier observations cannot be punished under a newer repetition configuration', async () => {
+  await repeatSave(); await rapid(imageMessage()); await rapid(imageMessage()); const last=imageMessage();
+  await enqueueAutoModCandidates(pool,guild,[{ messageId: last.id,channelId: channel,content: '',eventAt: new Date(),isCreate: true }]);
+  await save({ enabled: false,revision: 1,repeatWindowSeconds: 40 }); await processAutoModJob(pool,guild,deps); assert.equal(deletes.length,0); await rapid(imageMessage()); assert.equal(deletes.length,0);
+});
+test('old replayed creates and invalid image identity cannot add current repetition activity', async () => {
+  await repeatSave({ repeatLimit: 2 }); for(let i=0;i<3;i++) await rapid(imageMessage(),new Date(Date.now()-700000)); assert.equal(deletes.length,0); assert.equal(imageRequests.length,0);
+});
+test('repetition settings save independently with their own proof and preserve both existing rules', async () => {
+  await spamSave({ enabled: true }); const before=await readAutoModSettings(pool,guild);
+  assert.equal((await post(repeatForm(1))).status,303); const after=await readAutoModSettings(pool,guild); assert.equal(after.repeat_enabled,true); assert.equal(after.repeat_timeout_seconds,60);
+  for(const key of ['blocked_enabled','blocked_words','timeout_seconds','spam_enabled','spam_limit','spam_window_seconds','spam_timeout_seconds','exempt_role_ids','ignored_channel_ids'] as const) assert.deepEqual(after[key],before[key]);
+  assert.equal((await post(repeatForm(2,{ csrf: autoModSectionProof(token,2,'rapid_messages') }))).status,403);
+  assert.equal((await post(repeatForm(2,{ words: 'unrelated' }))).status,400); assert.equal((await post(repeatForm(2,{ repeat_limit: '99' }))).status,400);
+});
+test('shared-exemption changes prune repetition overrides without changing its configuration', async () => {
+  await repeatSave({ repeatEnforcedRoles: [mod],ignoredChannels: [otherChannel],repeatEnforcedChannels: [otherChannel] }); const shared=sectionForm('exemptions',1); shared.delete('ignored_channel'); assert.equal((await post(shared)).status,303);
+  const after=await readAutoModSettings(pool,guild); assert.equal(after.repeat_enabled,true); assert.deepEqual(after.repeat_enforced_role_ids,[]); assert.deepEqual(after.repeat_enforced_channel_ids,[]);
+});
+test('repetition save rejects expired stale nonstaff and invalid mode requests with atomic auditing', async () => {
+  roles=[mod]; assert.equal((await post(repeatForm())).status,403); roles=[admin]; const noModes=repeatForm(); noModes.delete('repeat_text'); noModes.delete('repeat_images'); assert.equal((await post(noModes)).status,400);
+  failAudit='AUTOMOD_SETTINGS_CHANGED'; assert.equal((await post(repeatForm())).status,503); failAudit=undefined; assert.equal((await query('SELECT * FROM automod_settings')).rows.length,0);
+  assert.equal((await post(repeatForm())).status,303); assert.equal((await post(repeatForm())).status,409);
+});
+test('image downloader permits only original Discord attachment URLs without credentials or redirects', async () => {
+  const id='900000000000000001'; const image={ id,url: `https://cdn.discordapp.com/attachments/${channel}/${id}/x.png?hm=secret`,size: 3 }; let fetched=0;
+  const loader=createImageFingerprinter((async (_url,options) => { fetched++; assert.equal(options?.redirect,'error'); assert.deepEqual(options?.headers,{ 'accept-encoding': 'identity' }); return new Response(Uint8Array.from([1,2,3])); }) as typeof fetch);
+  for(const address of [`http://cdn.discordapp.com/attachments/${channel}/${id}/x.png`,`https://cdn.discordapp.com.evil.test/attachments/${channel}/${id}/x.png`,`https://cdn.discordapp.com@127.0.0.1/attachments/${channel}/${id}/x.png`,`https://media.discordapp.net/attachments/${channel}/${id}/x.png`,`https://cdn.discordapp.com/attachments/${otherChannel}/${id}/x.png`]) {
+    assert.equal(trustedImageUrl({ ...image,url: address },channel),null); const result=await loader({ channelId: channel,images: [{ ...image,url: address }] }); assert.equal(result.hashes.length,0);
+  }
+  assert.equal(fetched,0); const good=await loader({ channelId: channel,images: [image] }); assert.equal(good.hashes.length,1); assert.equal(good.skipped,false);
+});
+test('image hashing compares bytes not URL filenames and caches only immutable attachment identity', async () => {
+  let count=0; const loader=createImageFingerprinter((async () => { count++; return new Response(imageBytes); }) as typeof fetch);
+  const a={ id: '900000000000000001',url: `https://cdn.discordapp.com/attachments/${channel}/900000000000000001/a.png`,size: imageBytes.length };
+  const b={ id: '900000000000000002',url: `https://cdn.discordapp.com/attachments/${channel}/900000000000000002/b.png`,size: imageBytes.length };
+  const first=await loader({ channelId: channel,images: [a] }); const second=await loader({ channelId: channel,images: [b] }); assert.deepEqual(first.hashes,second.hashes); await loader({ channelId: channel,images: [a] }); assert.equal(count,2);
+});
+test('image downloader skips oversized truncated overlong encoded redirected and unavailable responses', async () => {
+  const image={ id: '900000000000000001',url: `https://cdn.discordapp.com/attachments/${channel}/900000000000000001/x.png`,size: 3 };
+  for(const response of [new Response(Uint8Array.from([1,2])),new Response(Uint8Array.from([1,2,3,4])),new Response(Uint8Array.from([1,2,3]),{ headers: { 'content-length': '9' } }),new Response(Uint8Array.from([1,2,3]),{ headers: { 'content-encoding': 'gzip' } }),new Response(null,{ status: 302,headers: { location: 'http://127.0.0.1/' } }),new Response(null,{ status: 403 })]) {
+    const result=await createImageFingerprinter((async () => response) as typeof fetch)({ channelId: channel,images: [image] }); assert.equal(result.hashes.length,0); assert.equal(result.skipped,true);
+  }
+  let called=false; const result=await createImageFingerprinter((async () => { called=true; throw new Error('not reached'); }) as typeof fetch)({ channelId: channel,images: [{ ...image,size: imageByteLimit+1 }] }); assert.equal(called,false); assert.equal(result.skipped,true);
+});
+test('image downloads enforce per-message byte and file budgets and do not leak signed URLs in errors', async () => {
+  let count=0; const images=Array.from({ length: 12 },(_,i) => { const id=String(900000000000000000n+BigInt(i)); return { id,url: `https://cdn.discordapp.com/attachments/${channel}/${id}/x.png?hm=secret`,size: 1 }; });
+  const result=await createImageFingerprinter((async () => { count++; return new Response(Uint8Array.from([1])); }) as typeof fetch)({ channelId: channel,images }); assert.equal(count,10); assert.equal(result.hashes.length,1); assert.equal(result.skipped,true);
+  count=0; const large=images.slice(0,3).map((image) => ({ ...image,size: messageImageByteLimit/2 })); const limited=await createImageFingerprinter((async () => { count++; throw new Error('private signed URL'); }) as typeof fetch)({ channelId: channel,images: large }); assert.equal(count,2); assert.deepEqual(limited,{ hashes: [],skipped: true });
+});
+
+test('Discord image extraction uses original attachments, accepts missing dimensions and excludes videos', () => {
+  const image={ id: '900000000000000001',url: 'https://cdn.discordapp.com/original',proxy_url: 'https://media.discordapp.net/transformed',filename: 'original.png',size: 3,content_type: 'image/png' };
+  const selected=imageUploads([image,{ ...image,id: '900000000000000002',content_type: undefined },{ ...image,filename: 'movie.mp4',content_type: 'video/mp4' }]);
+  assert.equal(selected.length,2); assert.equal(selected[0]!.url,image.url); assert.ok(!JSON.stringify(selected).includes('transformed'));
+});
+test('raw image-only creates with empty text enter repetition intake but image edits do not add occurrences', async () => {
+  await repeatSave(); const value=imageMessage(); const event=parseAutoModEvent({ t: 'MESSAGE_CREATE',d: { guild_id: guild,id: value.id,channel_id: channel,content: '',author: { bot: false },attachments: value.images } },guild)!;
+  assert.equal(event.isCreate,true); await enqueueAutoModCandidates(pool,guild,[event]); await processAutoModJob(pool,guild,deps); assert.equal((await query('SELECT * FROM automod_repeat_activity')).rows.length,1);
+  const update=parseAutoModEvent({ t: 'MESSAGE_UPDATE',d: { guild_id: guild,id: value.id,channel_id: channel,content: '' } },guild)!; assert.equal(update.isCreate,false); await enqueueAutoModCandidates(pool,guild,[update]); assert.equal(await processAutoModJob(pool,guild,deps),false);
+});
+test('repetition overrides cannot change rapid-message or blocked-word exemption overrides', async () => {
+  await repeatSave({ repeatEnforcedRoles: [mod],ignoredChannels: [otherChannel],repeatEnforcedChannels: [otherChannel] });
+  let current=await readAutoModSettings(pool,guild); assert.deepEqual(current.spam_enforced_role_ids,[]); assert.deepEqual(current.spam_enforced_channel_ids,[]); assert.deepEqual(current.enforced_role_ids,[]); assert.deepEqual(current.enforced_channel_ids,[]);
+  assert.equal(autoModExempt(current,[mod],channel,null,'rapid_messages'),true); assert.equal(autoModExempt(current,[mod],channel,null,'repeated_messages'),false);
+  assert.equal((await post(sectionForm('rapid_messages',1))).status,303); current=await readAutoModSettings(pool,guild); assert.deepEqual(current.repeat_enforced_role_ids,[mod]); assert.deepEqual(current.repeat_enforced_channel_ids,[otherChannel]);
 });

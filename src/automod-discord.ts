@@ -1,8 +1,12 @@
 import { ChannelType, PermissionFlagsBits, REST, Routes } from 'discord.js';
-import type { APIMessage, Client, RESTPatchAPIGuildMemberResult } from 'discord.js';
+import type { APIAttachment, APIMessage, Client, RESTPatchAPIGuildMemberResult } from 'discord.js';
+import { createImageFingerprinter } from './image-fingerprints.js';
 import { AutoModError } from './automod-settings.js';
 import type { AutoModResources } from './automod-settings.js';
 import type { AutoModDependencies } from './automod-engine.js';
+export function imageUploads(attachments: APIAttachment[]) {
+  return attachments.filter((a) => a.content_type?.startsWith('image/') || !a.content_type && /\.(?:png|jpe?g|gif|webp|avif|bmp|tiff?|apng|svg)$/i.test(a.filename)).map((a) => ({ id: a.id,url: a.url,size: a.size }));
+}
 const missing=(error: unknown) => error && typeof error==='object' && 'code' in error && [10003,10008].includes(Number(error.code));
 export function autoModResources(client: Client,guildId: string): () => Promise<AutoModResources> {
   return async () => {
@@ -15,11 +19,11 @@ export function autoModResources(client: Client,guildId: string): () => Promise<
 export function autoModDependencies(client: Client,guildId: string,token: string,writerOverride?: Pick<REST,'get'|'delete'|'patch'|'post'>): AutoModDependencies {
   const writer=writerOverride ?? new REST({ version: '10',retries: 0,timeout: 15000 }).setToken(token);
   const botId=() => { if(!client.user) throw new AutoModError('BOT_NOT_READY'); return client.user.id; };
-  return { botId,
+  return { botId,imageFingerprints: createImageFingerprinter(),
     readMessage: async (channel,id) => {
       try { const source=await writer.get(Routes.channelMessage(channel,id),{ signal: AbortSignal.timeout(15000) }) as APIMessage;
         if(source.id!==id || source.channel_id!==channel || !source.author?.id || typeof source.content!=='string') throw new AutoModError('INVALID_MESSAGE');
-        return { id: source.id,channelId: channel,userId: source.author.id,content: source.content,bot: !!source.author.bot,webhook: !!source.webhook_id };
+        return { ...(imageUploads(source.attachments ?? []).length?{ images: imageUploads(source.attachments ?? []) }:{}),id: source.id,channelId: channel,userId: source.author.id,content: source.content,bot: !!source.author.bot,webhook: !!source.webhook_id };
       } catch(error) { if(missing(error)) return null; throw error; }
     },
     readContext: async (channelId,userId) => {

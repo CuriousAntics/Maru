@@ -40,14 +40,16 @@ export async function handleAutoModPage(request: IncomingMessage,input: {
     }
     const resources=await readResources(),settings=await readAutoModSettings(pool,guildId,resources);
     const recent=(await pool.query<Record<string,unknown>>('SELECT rule_key,message_id,user_id,channel_id,matched_entries,delete_status,violation_count,case_number,timeout_note,log_status,detected_at FROM automod_violations WHERE guild_id=$1 ORDER BY detected_at DESC,message_id DESC LIMIT 20',[guildId])).rows;
+    const skipped=(await pool.query<{ count: number }>("SELECT count(*)::int AS count FROM automod_repeat_activity WHERE guild_id=$1 AND image_status='partly_skipped' AND occurred_at>NOW()-INTERVAL '1 hour'",[guildId])).rows[0]!.count;
     const pending=(await pool.query<{ count: number }>('SELECT count(*)::int AS count FROM automod_jobs WHERE guild_id=$1 AND version>processed_version AND attempts>0',[guildId])).rows[0]!.count;
-    views.html(200,(nonce) => autoModPage(settings,resources,recent,pending,access,token,logoutProof(token),nonce));
+    views.html(200,(nonce) => autoModPage(settings,resources,recent,pending,skipped,access,token,logoutProof(token),nonce));
   } catch(error) {
     if(!(error instanceof AutoModError)) throw error;
     const messages: Record<string,[number,string]>={
       ADMIN_REQUIRED: [403,'Only Admins and Mods granted full access may change AutoMod settings.'],SESSION_EXPIRED: [403,'Sign in again before saving.'],
       BUSY: [409,'Maru is processing moderation work. Wait a moment, reload and save again.'],STALE_SETTINGS: [409,'The settings changed. Reload before saving.'],
       INVALID_WORDS: [400,'Use up to 100 distinct entries, separated by commas or new lines, with 1–100 characters each. An enabled filter needs at least one entry.'],
+      INVALID_REPEAT: [400,'Choose text, images, or both; use 2–50 occurrences and a 1–300 second window.'],
       INVALID_SPAM: [400,'Use a message limit of 2–50 and a window of 1–60 seconds.'],
       INVALID_DURATION: [400,'Use a timeout such as 10m, 1h or 1d, between 1s and 28d.'],INVALID_REASON: [400,'Enter a reason from 1 to 500 characters.'],
       INVALID_SELECTION: [400,'Choose available server roles/channels. Each rule exception must also be selected in its global exemption list.'],
@@ -60,11 +62,11 @@ export async function handleAutoModPage(request: IncomingMessage,input: {
     views.html(status,(nonce) => layout('AutoMod settings not saved',`<div class="hero"><h1>Settings not saved</h1><p role="alert">${e(text)}</p><a class="button" href="/automod">Back to AutoMod</a></div>`,nonce,logoutProof(token)));
   }
 }
-function autoModPage(s: AutoModSettings,res: AutoModResources,recent: Record<string,unknown>[],pending: number,access: 'admin'|'moderator',token: string,logout: string,nonce: string) {
-  const options=(name: string,entries: { id: string; name: string }[],selected: string[]) => `<fieldset class="channel-choices"><legend>${({ exempt_role: 'Exempt roles',ignored_channel: 'Ignored channels',enforced_role: 'Roles checked by this rule',enforced_channel: 'Channels checked by the blocked-word rule',spam_enforced_role: 'Roles checked by the rapid-message rule',spam_enforced_channel: 'Channels checked by the rapid-message rule' } as Record<string,string>)[name]}</legend>`+
+function autoModPage(s: AutoModSettings,res: AutoModResources,recent: Record<string,unknown>[],pending: number,skipped: number,access: 'admin'|'moderator',token: string,logout: string,nonce: string) {
+  const options=(name: string,entries: { id: string; name: string }[],selected: string[]) => `<fieldset class="channel-choices"><legend>${({ exempt_role: 'Exempt roles',ignored_channel: 'Ignored channels',enforced_role: 'Roles checked by this rule',enforced_channel: 'Channels checked by the blocked-word rule',spam_enforced_role: 'Roles checked by the rapid-message rule',spam_enforced_channel: 'Channels checked by the rapid-message rule',repeat_enforced_role: 'Roles checked by the repeated-message rule',repeat_enforced_channel: 'Channels checked by the repeated-message rule' } as Record<string,string>)[name]}</legend>`+
     entries.map((entry) => `<label class="channel-choice"><input type="checkbox" name="${name}" value="${entry.id}"${selected.includes(entry.id)?' checked':''}>${e(entry.name)}</label>`).join('')+
     selected.filter((id) => !entries.some((entry) => entry.id===id)).map((id) => `<label class="channel-choice"><input type="checkbox" name="${name}" value="${id}" checked>Unavailable (${id})</label>`).join('')+'</fieldset>';
-  const rows=recent.map((v) => `<tr><td class="mono">${e(v.user_id)}<div>${e(v.channel_id)}</div></td><td><div>${e(v.rule_key==='rapid_messages'?'Rapid messages':'Blocked words')}</div>${e((v.matched_entries as string[]).join(', '))}</td><td>${e(v.delete_status)}</td><td>${e(v.violation_count)}</td><td>${e(v.timeout_note)}${v.case_number?`<div><a href="/cases/${e(v.case_number)}">Case #${e(v.case_number)}</a></div>`:''}</td><td>${e(v.log_status)}</td></tr>`).join('');
+  const rows=recent.map((v) => `<tr><td class="mono">${e(v.user_id)}<div>${e(v.channel_id)}</div></td><td><div>${e(v.rule_key==='repeated_messages'?'Repeated messages':v.rule_key==='rapid_messages'?'Rapid messages':'Blocked words')}</div>${e((v.matched_entries as string[]).join(', '))}</td><td>${e(v.delete_status)}</td><td>${e(v.violation_count)}</td><td>${e(v.timeout_note)}${v.case_number?`<div><a href="/cases/${e(v.case_number)}">Case #${e(v.case_number)}</a></div>`:''}</td><td>${e(v.log_status)}</td></tr>`).join('');
   const open=(section: string) => `<form method="post" action="/automod"><input type="hidden" name="section" value="${section}"><input type="hidden" name="csrf" value="${e(autoModSectionProof(token,s.revision,section))}"><input type="hidden" name="revision" value="${s.revision}">`;
   const close=(section: string,label: string) => `<label for="${section}_reason">Reason for change</label><textarea id="${section}_reason" name="reason" required maxlength="500"></textarea><button type="submit">${label}</button></form>`;
   const form=access==='admin'?`
@@ -84,27 +86,39 @@ function autoModPage(s: AutoModSettings,res: AutoModResources,recent: Record<str
     <h3>Exceptions for the rapid-message rule</h3><p>Select globally exempt roles or channels that this rule should check.</p>
     ${options('spam_enforced_role',res.roles,s.spam_enforced_role_ids ?? [])}${options('spam_enforced_channel',res.channels,s.spam_enforced_channel_ids ?? [])}
     ${close('rapid_messages','Save rapid messaging')}
+    <h2>Repeated-message filtering</h2>${open('repeated_messages')}
+    <label class="channel-choice"><input type="checkbox" name="repeat_enabled" value="true"${s.repeat_enabled?' checked':''}>Enable repeated-message filtering</label>
+    <label class="channel-choice"><input type="checkbox" name="repeat_text" value="true"${(s.repeat_text ?? true)?' checked':''}>Check repeated text</label>
+    <label class="channel-choice"><input type="checkbox" name="repeat_images" value="true"${(s.repeat_images ?? true)?' checked':''}>Check identical image uploads (exact file bytes)</label>
+    <label for="repeat_limit">Trigger on occurrence number</label><input id="repeat_limit" name="repeat_limit" type="number" min="2" max="50" required value="${s.repeat_limit ?? 3}">
+    <label for="repeat_window">Rolling repetition window (seconds)</label><input id="repeat_window" name="repeat_window" type="number" min="1" max="300" required value="${s.repeat_window_seconds ?? 30}">
+    <label for="repeat_timeout">Timeout after five repeated-message violations in ten minutes</label><input id="repeat_timeout" name="repeat_timeout" required maxlength="32" value="${(s.repeat_timeout_seconds ?? 600)%60===0?(s.repeat_timeout_seconds ?? 600)/60+'m':s.repeat_timeout_seconds+'s'}">
+    <p>Default: remove the third and further occurrences within 30 seconds, per member across eligible channels. Text ignores capitalization and repeated spaces. Either matching text or any identical uploaded image can trigger; filenames and captions do not change image identity. Each removed message counts once. Resized, recompressed, linked and embedded images are outside exact-file matching. Image checks allow up to 25 MiB per file, 50 MiB and ten files per message; unavailable files are skipped, never assumed to match.</p>
+    <h3>Exceptions for the repeated-message rule</h3>${options('repeat_enforced_role',res.roles,s.repeat_enforced_role_ids ?? [])}${options('repeat_enforced_channel',res.channels,s.repeat_enforced_channel_ids ?? [])}
+    ${close('repeated_messages','Save repeated messages')}
     <h2>Shared exemptions</h2>${open('exemptions')}
-    <p>These settings apply to both rules. Select your Admin, Mods, Owner and Community Manager roles, plus globally ignored channels. Removing a shared exemption also removes its per-rule overrides.</p>
+    <p>These settings apply to all rules. Select your Admin, Mods, Owner and Community Manager roles, plus globally ignored channels. Removing a shared exemption also removes its per-rule overrides.</p>
     ${options('exempt_role',res.roles,s.exempt_role_ids)}${options('ignored_channel',res.channels,s.ignored_channel_ids)}
     ${close('exemptions','Save shared exemptions')}
-    <p class="small">Each button saves its own section and refreshes this page. Save one section before editing another. Changing settings starts a fresh rapid-message observation window; ten-minute violation counters remain.</p>`:
+    <p class="small">Each button saves its own section and refreshes this page. Save one section before editing another. Changing settings starts fresh rapid-message and repetition observation windows; ten-minute violation counters remain.</p>`:
     `<p>Only Admins and Mods granted full access can change settings.</p><h3>Blocked entries</h3><p class="case-reason">${e(s.blocked_words.join(', ') || 'None configured')}</p><p>${s.exempt_role_ids.length} exempt roles · ${s.ignored_channel_ids.length} ignored channels</p>`;
-  return layout('AutoMod',`<div class="hero"><div class="eyebrow">Automatic moderation</div><h1>AutoMod</h1><p>Blocked words: ${s.blocked_enabled?'On':'Off'} · Revision ${s.revision} · Timeout ${e(durationLabel(s.timeout_seconds))}</p><p>Rapid messages: ${s.spam_enabled?'On':'Off'} · Limit ${s.spam_limit ?? 5} in ${s.spam_window_seconds ?? 5}s · Timeout ${e(durationLabel(s.spam_timeout_seconds ?? 600))}</p></div><div class="notice">Case-insensitive whole-word and phrase matching on new messages and edits. Matching messages are removed after posting. Logs go to the saved moderation log channel with mentions disabled. No automatic DMs are sent. Bots, webhooks and the server owner are excluded.</div>${!res.canDelete || !res.canTimeout?'<p role="alert">Maru needs Manage Messages and Moderate Members permissions before enabling.</p>':''}${pending?`<p role="alert">${pending} message(s) are awaiting another check after a processing failure. Check bot channel permissions and host logs.</p>`:''}<section class="card">${form}</section><h2>Recent violations</h2><p class="small">Latest 20 · counts and outcomes recorded during processing, not a live member-status check.</p><div class="table-wrap"><table><thead><tr><th>Member / channel</th><th>Entries</th><th>Removal</th><th>Count</th><th>Timeout</th><th>Log</th></tr></thead><tbody>${rows || '<tr><td colspan="6">No violations recorded.</td></tr>'}</tbody></table></div>`,nonce,logout);
+  return layout('AutoMod',`<div class="hero"><div class="eyebrow">Automatic moderation</div><h1>AutoMod</h1><p>Blocked words: ${s.blocked_enabled?'On':'Off'} · Revision ${s.revision} · Timeout ${e(durationLabel(s.timeout_seconds))}</p><p>Rapid messages: ${s.spam_enabled?'On':'Off'} · Limit ${s.spam_limit ?? 5} in ${s.spam_window_seconds ?? 5}s · Timeout ${e(durationLabel(s.spam_timeout_seconds ?? 600))}</p><p>Repeated messages: ${s.repeat_enabled?'On':'Off'} · Trigger ${s.repeat_limit ?? 3} in ${s.repeat_window_seconds ?? 30}s · Timeout ${e(durationLabel(s.repeat_timeout_seconds ?? 600))}</p></div><div class="notice">Case-insensitive whole-word and phrase matching on new messages and edits. Matching messages are removed after posting. Logs go to the saved moderation log channel with mentions disabled. No automatic DMs are sent. Bots, webhooks and the server owner are excluded.</div>${!res.canDelete || !res.canTimeout?'<p role="alert">Maru needs Manage Messages and Moderate Members permissions before enabling.</p>':''}${skipped?`<p role="alert">${skipped} message(s) in the last hour had images that could not be checked because of download limits or availability. Those files did not count as matches.</p>`:''}${pending?`<p role="alert">${pending} message(s) are awaiting another check after a processing failure. Check bot channel permissions and host logs.</p>`:''}<section class="card">${form}</section><h2>Recent violations</h2><p class="small">Latest 20 · counts and outcomes recorded during processing, not a live member-status check.</p><div class="table-wrap"><table><thead><tr><th>Member / channel</th><th>Entries</th><th>Removal</th><th>Count</th><th>Timeout</th><th>Log</th></tr></thead><tbody>${rows || '<tr><td colspan="6">No violations recorded.</td></tr>'}</tbody></table></div>`,nonce,logout);
 }
 
 async function saveSection(params: URLSearchParams,input: Parameters<typeof handleAutoModPage>[1]): Promise<void> {
   const section=params.get('section');
-  const fields: Record<string,{ scalar: string[]; arrays: string[]; flag?: string }>={
+  const fields: Record<string,{ scalar: string[]; arrays: string[]; flag?: string; flags?: string[] }>={
     blocked_words: { scalar: ['words','timeout'],arrays: ['enforced_role','enforced_channel'],flag: 'enabled' },
     rapid_messages: { scalar: ['spam_limit','spam_window','spam_timeout'],arrays: ['spam_enforced_role','spam_enforced_channel'],flag: 'spam_enabled' },
+    repeated_messages: { scalar: ['repeat_limit','repeat_window','repeat_timeout'],arrays: ['repeat_enforced_role','repeat_enforced_channel'],flags: ['repeat_enabled','repeat_text','repeat_images'] },
     exemptions: { scalar: [],arrays: ['exempt_role','ignored_channel'] },
   };
   const spec=section && Object.hasOwn(fields,section)?fields[section]:undefined;
   if(!spec) throw new AutoModError('INVALID_INPUT');
-  const scalar=['section','csrf','revision','reason',...spec.scalar],allowed=[...scalar,...spec.arrays,...(spec.flag?[spec.flag]:[])];
+  const flags=spec.flags ?? (spec.flag?[spec.flag]:[]);
+  const scalar=['section','csrf','revision','reason',...spec.scalar],allowed=[...scalar,...spec.arrays,...flags];
   if(scalar.some((key) => params.getAll(key).length!==1) || [...params.keys()].some((key) => !allowed.includes(key)) ||
-    spec.flag && (params.getAll(spec.flag).length>1 || params.has(spec.flag) && params.get(spec.flag)!=='true')) throw new AutoModError('INVALID_INPUT');
+    flags.some((flag) => params.getAll(flag).length>1 || params.has(flag) && params.get(flag)!=='true')) throw new AutoModError('INVALID_INPUT');
   const revision=params.get('revision')!;
   if(!/^(0|[1-9]\d{0,9})$/.test(revision) || Number(revision)>2147483647) throw new AutoModError('INVALID_INPUT');
   if(!equal(params.get('csrf')!,autoModSectionProof(input.token,Number(revision),section!))) throw new AutoModError('CSRF');
@@ -112,6 +126,7 @@ async function saveSection(params: URLSearchParams,input: Parameters<typeof hand
   if(current.revision!==Number(revision)) throw new AutoModError('STALE_SETTINGS');
   const changes={ enabled: current.blocked_enabled,words: current.blocked_words.join('\n'),timeoutSeconds: current.timeout_seconds,
     spamEnabled: current.spam_enabled ?? false,spamLimit: current.spam_limit ?? 5,spamWindowSeconds: current.spam_window_seconds ?? 5,spamTimeoutSeconds: current.spam_timeout_seconds ?? 600,
+    repeatEnabled: current.repeat_enabled ?? false,repeatText: current.repeat_text ?? true,repeatImages: current.repeat_images ?? true,repeatLimit: current.repeat_limit ?? 3,repeatWindowSeconds: current.repeat_window_seconds ?? 30,repeatTimeoutSeconds: current.repeat_timeout_seconds ?? 600,repeatEnforcedRoles: current.repeat_enforced_role_ids ?? [],repeatEnforcedChannels: current.repeat_enforced_channel_ids ?? [],
     exemptRoles: current.exempt_role_ids,ignoredChannels: current.ignored_channel_ids,enforcedRoles: current.enforced_role_ids,enforcedChannels: current.enforced_channel_ids,
     spamEnforcedRoles: current.spam_enforced_role_ids ?? [],spamEnforcedChannels: current.spam_enforced_channel_ids ?? [] };
   try {
@@ -122,9 +137,15 @@ async function saveSection(params: URLSearchParams,input: Parameters<typeof hand
       if(!/^\d{1,2}$/.test(params.get('spam_limit')!) || !/^\d{1,2}$/.test(params.get('spam_window')!)) throw new AutoModError('INVALID_SPAM');
       changes.spamEnabled=params.has('spam_enabled'); changes.spamLimit=Number(params.get('spam_limit')); changes.spamWindowSeconds=Number(params.get('spam_window'));
       changes.spamTimeoutSeconds=parseTimeoutDuration(params.get('spam_timeout')!); changes.spamEnforcedRoles=params.getAll('spam_enforced_role'); changes.spamEnforcedChannels=params.getAll('spam_enforced_channel');
+    } else if(section==='repeated_messages') {
+      if(!/^\d{1,2}$/.test(params.get('repeat_limit')!) || !/^\d{1,3}$/.test(params.get('repeat_window')!)) throw new AutoModError('INVALID_REPEAT');
+      changes.repeatEnabled=params.has('repeat_enabled'); changes.repeatText=params.has('repeat_text'); changes.repeatImages=params.has('repeat_images');
+      changes.repeatLimit=Number(params.get('repeat_limit')); changes.repeatWindowSeconds=Number(params.get('repeat_window')); changes.repeatTimeoutSeconds=parseTimeoutDuration(params.get('repeat_timeout')!);
+      changes.repeatEnforcedRoles=params.getAll('repeat_enforced_role'); changes.repeatEnforcedChannels=params.getAll('repeat_enforced_channel');
     } else {
       changes.exemptRoles=params.getAll('exempt_role'); changes.ignoredChannels=params.getAll('ignored_channel');
       changes.enforcedRoles=changes.enforcedRoles.filter((id) => changes.exemptRoles.includes(id)); changes.enforcedChannels=changes.enforcedChannels.filter((id) => changes.ignoredChannels.includes(id));
+      changes.repeatEnforcedRoles=changes.repeatEnforcedRoles.filter((id) => changes.exemptRoles.includes(id)); changes.repeatEnforcedChannels=changes.repeatEnforcedChannels.filter((id) => changes.ignoredChannels.includes(id));
       changes.spamEnforcedRoles=changes.spamEnforcedRoles.filter((id) => changes.exemptRoles.includes(id)); changes.spamEnforcedChannels=changes.spamEnforcedChannels.filter((id) => changes.ignoredChannels.includes(id));
     }
   } catch(error) { if(error instanceof AutoModError) throw error; throw new AutoModError('INVALID_DURATION'); }
