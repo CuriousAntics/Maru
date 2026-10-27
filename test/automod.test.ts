@@ -95,6 +95,7 @@ beforeEach(async () => {
 after(async () => { await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }); await db.close(); });
 
 test('literal matching is case insensitive and uses Unicode word boundaries and normalized phrases', () => {
+  assert.deepEqual(parseBlockedWords(' Bad, BAD, bad   phrase, a+b,,\r\n other '),['bad','bad phrase','a+b','other']);
   const entries=parseBlockedWords(' Bad \n BAD\n bad   phrase \n a+b'); assert.deepEqual(entries,['bad','bad phrase','a+b']);
   assert.deepEqual(matchBlockedWords('BAD, and bad\nphrase with a+b!',entries),entries);
   assert.deepEqual(matchBlockedWords('badminton notbad bad_name bad123 badé',entries),[]);
@@ -214,7 +215,9 @@ test('HTTP page is authenticated, Mods can view but cannot change settings', asy
   assert.equal((await post()).status,403);
 });
 test('HTTP form saves an enabled rule and refresh shows its current configuration', async () => {
-  const response=await post(); assert.equal(response.status,303); const html=await (await request('/automod')).text(); assert.match(html,/On · Revision 1/); assert.match(html,/marutestword/);
+  const response=await post(form({ words: 'marutestword, bad phrase' })); assert.equal(response.status,303); const html=await (await request('/automod')).text(); assert.match(html,/On · Revision 1/); assert.match(html,/marutestword, bad phrase/);
+  assert.match(html,/Blocked words and phrases — separated by commas/);
+  assert.deepEqual((await readAutoModSettings(pool,guild)).blocked_words,['marutestword','bad phrase']);
 });
 test('HTTP same origin exact fields session-purpose proofs and body limits protect settings', async () => {
   for(const origin of ['null','https://elsewhere.test','']) assert.equal((await post(form(),{ origin })).status,403);
