@@ -41,3 +41,7 @@ The in-memory intake has a 5,000-message bound before persistence. A crash, disc
 7. Restore **5 messages / 5 seconds / 10m timeout**, turn the rule Off, save, and retain existing production protections until rollout is agreed.
 
 Disable both AutoMod rules before rolling back to an older application build that predates migration 011; older code does not scope all records by rule. Do not edit or reverse applied migrations.
+
+## Separate saves
+
+The page has independent **Save blocked words**, **Save rapid messaging**, and **Save shared exemptions** buttons. Each section requires its own reason. A rule save preserves the other rule and shared exemption selections; a shared-exemption save preserves both rule configurations and removes overrides for exemptions no longer selected. Save one section before editing another, because each save refreshes the page. All sections share the existing revision/stale-form protection and audit transaction. Changing any section still starts a fresh short rapid-message observation window as before. Older combined forms remain supported for deployment compatibility. No migration is needed for this page change.

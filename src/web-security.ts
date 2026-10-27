@@ -71,3 +71,7 @@ export function starboardProof(token: string, boardId: string, revision: number,
 export function autoModProof(token: string,revision: number): string {
   return createHmac('sha256',token).update(`maru-automod-settings:${revision}`).digest('base64url');
 }
+
+export function autoModSectionProof(token: string,revision: number,section: string): string {
+  return autoModProof(`${token}:${section}`,revision);
+}
