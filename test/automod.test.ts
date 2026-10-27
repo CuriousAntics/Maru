@@ -7,7 +7,7 @@ import { PGlite } from '@electric-sql/pglite';
 import type { Pool } from 'pg';
 import type { APIMessage, Client, REST, RESTPostAPIChannelMessageJSONBody } from 'discord.js';
 import { createDashboardHandler } from '../src/dashboard.js';
-import { autoModProof, digest, randomToken, settingsProof } from '../src/web-security.js';
+import { autoModProof, autoModSectionProof, digest, randomToken, settingsProof } from '../src/web-security.js';
 import { AutoModError, autoModExempt, readAutoModSettings, saveAutoModSettings } from '../src/automod-settings.js';
 import type { AutoModResources } from '../src/automod-settings.js';
 import { matchBlockedWords, parseBlockedWords } from '../src/blocked-words.js';
@@ -24,6 +24,7 @@ const actor='300000000000000001',member='300000000000000002',bot='30000000000000
 const channel='500000000000000001',logs='500000000000000002',otherChannel='500000000000000003';
 let messageId=600000000000000000n;
 let token=randomToken(),roles: string[] | null,resources: AutoModResources;
+let connectHook: (() => Promise<void>) | undefined;
 let failAudit: string | undefined,failClaim=false,busy=false,failUnlock=false,discarded=false,transaction=false;
 async function query(sql: string,values?: unknown[]) {
   if(busy && sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: false }],rowCount: 1 };
@@ -33,7 +34,7 @@ async function query(sql: string,values?: unknown[]) {
   const result=await db.query(sql,values); if(sql==='BEGIN') transaction=true; if(['ROLLBACK','COMMIT'].includes(sql)) transaction=false;
   return { rows: result.rows,rowCount: result.rows.length || result.affectedRows || 0 };
 }
-const pool={ query,async connect() { return { query,release(error?: Error) { if(error) discarded=true; } }; } } as unknown as Pool;
+const pool={ query,async connect() { const hook=connectHook; connectHook=undefined; await hook?.(); return { query,release(error?: Error) { if(error) discarded=true; } }; } } as unknown as Pool;
 let readHook: (() => Promise<void>) | undefined;
 const readRoles=async () => { await readHook?.(); return roles; };
 const readResources=async () => resources;
@@ -80,7 +81,7 @@ before(async () => {
   await new Promise<void>((resolve) => server.listen(0,'127.0.0.1',resolve)); base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
-  failAudit=undefined; failClaim=busy=failUnlock=discarded=transaction=false; readHook=contextHook=undefined;
+  connectHook=undefined; failAudit=undefined; failClaim=busy=failUnlock=discarded=transaction=false; readHook=contextHook=undefined;
   nativeFailure=logFailure=deleteFailure=undefined; actions=[]; sent=[]; deletes=[]; messages=new Map(); token=randomToken(); roles=[admin]; ready=true;
   resources={ roles: [{ id: admin,name: 'Admin' },{ id: mod,name: 'Mods' },{ id: community,name: 'Community Manager' }],
     channels: [{ id: channel,name: 'general' },{ id: logs,name: 'logs' },{ id: otherChannel,name: 'finished-work' }],canDelete: true,canTimeout: true };
@@ -309,7 +310,7 @@ test('old manual case inserts remain compatible with the new origin column', asy
 });
 test('the actual rendered AutoMod form has a working session and revision proof', async () => {
   const page=await request('/automod'); const html=await page.text();
-  assert.equal(page.headers.get('referrer-policy'),'same-origin'); assert.ok(html.includes(`name="csrf" value="${autoModProof(token,0)}"`));
+  assert.equal(page.headers.get('referrer-policy'),'same-origin'); assert.ok(html.includes(`name="csrf" value="${autoModSectionProof(token,0,'blocked_words')}"`));
   assert.equal((await post(form({ csrf: autoModProof(token,0) }))).status,303);
 });
 test('server configuration and other moderation settings are preserved by AutoMod edits', async () => {
@@ -522,4 +523,79 @@ test('creates queued while spam is Off cannot count when the rule is enabled bef
   for(let i=0;i<5;i++) { const v=message(); await enqueueAutoModCandidates(pool,guild,[{ messageId: v.id,channelId: channel,content: v.content,eventAt: at,isCreate: true }]); }
   await save({ enabled: false,revision: 1,spamEnabled: true,spamLimit: 2 }); while(await processAutoModJob(pool,guild,deps)) { /* drain */ }
   assert.equal(deletes.length,0); assert.equal((await query('SELECT * FROM automod_message_activity')).rows.length,0);
+});
+
+function sectionForm(section: string,revision=0,overrides: Record<string,string>={}) {
+  const defaults: Record<string,Record<string,string>>={ blocked_words: { enabled: 'true',words: 'newword, another phrase',timeout: '2m' },rapid_messages: { spam_enabled: 'true',spam_limit: '3',spam_window: '8',spam_timeout: '1m' },exemptions: { exempt_role: admin,ignored_channel: otherChannel } };
+  return new URLSearchParams({ section,revision: String(revision),csrf: autoModSectionProof(token,revision,section),reason: 'Save this section',...defaults[section],...overrides });
+}
+test('AutoMod renders three independent forms with distinct save buttons and section proofs', async () => {
+  const html=await (await request('/automod')).text(); const forms=[...html.matchAll(/<form method="post" action="\/automod">([\s\S]*?)<\/form>/g)].map((match) => match[1]!);
+  assert.equal(forms.length,3);
+  for(const [index,section] of ['blocked_words','rapid_messages','exemptions'].entries()) {
+    assert.ok(forms[index]!.includes(`name="section" value="${section}"`)); assert.ok(forms[index]!.includes(autoModSectionProof(token,0,section))); assert.ok(forms[index]!.includes('name="reason"'));
+  }
+  assert.match(forms[0]!,/Save blocked words/); assert.ok(!forms[0]!.includes('name="spam_limit"')); assert.ok(!forms[0]!.includes('name="exempt_role"'));
+  assert.match(forms[1]!,/Save rapid messaging/); assert.ok(!forms[1]!.includes('name="words"'));
+  assert.match(forms[2]!,/Save shared exemptions/); assert.ok(!forms[2]!.includes('name="enabled"'));
+});
+test('saving blocked words preserves every rapid-message setting and shared exemption', async () => {
+  await spamSave({ enabled: true,spamLimit: 7,spamWindowSeconds: 12,spamTimeoutSeconds: 120,ignoredChannels: [otherChannel],spamEnforcedRoles: [mod],spamEnforcedChannels: [otherChannel] });
+  const before=await readAutoModSettings(pool,guild); assert.equal((await post(sectionForm('blocked_words',1))).status,303);
+  const after=await readAutoModSettings(pool,guild); assert.deepEqual(after.blocked_words,['newword','another phrase']); assert.equal(after.timeout_seconds,120);
+  for(const key of ['spam_enabled','spam_limit','spam_window_seconds','spam_timeout_seconds','spam_enforced_role_ids','spam_enforced_channel_ids','exempt_role_ids','ignored_channel_ids'] as const) assert.deepEqual(after[key],before[key]);
+});
+test('saving rapid messaging preserves all blocked-word fields and shared exemptions', async () => {
+  await save({ enabled: true,enforcedRoles: [mod],ignoredChannels: [otherChannel],enforcedChannels: [otherChannel] }); const before=await readAutoModSettings(pool,guild);
+  assert.equal((await post(sectionForm('rapid_messages',1))).status,303); const after=await readAutoModSettings(pool,guild);
+  assert.equal(after.spam_enabled,true); assert.equal(after.spam_limit,3); assert.equal(after.spam_window_seconds,8); assert.equal(after.spam_timeout_seconds,60);
+  for(const key of ['blocked_enabled','blocked_words','timeout_seconds','enforced_role_ids','enforced_channel_ids','exempt_role_ids','ignored_channel_ids'] as const) assert.deepEqual(after[key],before[key]);
+});
+test('an unchecked section toggle disables only the selected rule', async () => {
+  await spamSave({ enabled: true }); const blocked=sectionForm('blocked_words',1); blocked.delete('enabled'); assert.equal((await post(blocked)).status,303);
+  let current=await readAutoModSettings(pool,guild); assert.equal(current.blocked_enabled,false); assert.equal(current.spam_enabled,true);
+  const spam=sectionForm('rapid_messages',2); spam.delete('spam_enabled'); assert.equal((await post(spam)).status,303);
+  current=await readAutoModSettings(pool,guild); assert.equal(current.spam_enabled,false); assert.equal(current.blocked_enabled,false);
+});
+test('shared-exemption saves preserve rule configuration and prune only overrides for removed exemptions', async () => {
+  await spamSave({ enabled: true,enforcedRoles: [mod],spamEnforcedRoles: [mod],ignoredChannels: [otherChannel],enforcedChannels: [otherChannel],spamEnforcedChannels: [otherChannel] });
+  const before=await readAutoModSettings(pool,guild); const form=sectionForm('exemptions',1); form.delete('ignored_channel');
+  assert.equal((await post(form)).status,303); const after=await readAutoModSettings(pool,guild);
+  assert.deepEqual(after.exempt_role_ids,[admin]); assert.deepEqual(after.ignored_channel_ids,[]); assert.deepEqual(after.enforced_role_ids,[]); assert.deepEqual(after.spam_enforced_role_ids,[]); assert.deepEqual(after.enforced_channel_ids,[]); assert.deepEqual(after.spam_enforced_channel_ids,[]);
+  for(const key of ['blocked_enabled','blocked_words','timeout_seconds','spam_enabled','spam_limit','spam_window_seconds','spam_timeout_seconds'] as const) assert.deepEqual(after[key],before[key]);
+});
+test('section saves reject another section proof and fields from a different form', async () => {
+  assert.equal((await post(sectionForm('rapid_messages',0,{ csrf: autoModSectionProof(token,0,'blocked_words') }))).status,403);
+  assert.equal((await post(sectionForm('rapid_messages',0,{ csrf: autoModProof(token,0) }))).status,403);
+  assert.equal((await post(sectionForm('blocked_words',0,{ spam_limit: '9' }))).status,400);
+  assert.equal((await post(sectionForm('rapid_messages',0,{ exempt_role: mod }))).status,400);
+  for(const section of ['unknown','__proto__','constructor']) assert.equal((await post(sectionForm(section))).status,400);
+  assert.equal((await query('SELECT * FROM automod_settings')).rows.length,0);
+});
+test('section saves reject duplicate missing and invalid fields before any write', async () => {
+  const duplicated=sectionForm('blocked_words'); duplicated.append('section','blocked_words'); assert.equal((await post(duplicated)).status,400);
+  const missing=sectionForm('rapid_messages'); missing.delete('spam_timeout'); assert.equal((await post(missing)).status,400);
+  assert.equal((await post(sectionForm('blocked_words',0,{ timeout: 'forever' }))).status,400);
+  assert.equal((await post(sectionForm('rapid_messages',0,{ spam_limit: '99' }))).status,400);
+  assert.equal((await post(sectionForm('exemptions',0,{ reason: '' }))).status,400);
+  assert.equal((await query('SELECT * FROM automod_settings')).rows.length,0);
+});
+test('saving one section makes older forms stale without overwriting the saved change', async () => {
+  assert.equal((await post(sectionForm('blocked_words'))).status,303); assert.equal((await post(sectionForm('rapid_messages'))).status,409);
+  const saved=await readAutoModSettings(pool,guild); assert.deepEqual(saved.blocked_words,['newword','another phrase']); assert.equal(saved.spam_enabled,false);
+});
+test('a concurrent settings update during section authorization is rejected under the service lock', async () => {
+  await save(); connectHook=async () => { await query('UPDATE automod_settings SET revision=revision+1,spam_limit=9 WHERE guild_id=$1',[guild]); };
+  assert.equal((await post(sectionForm('blocked_words',1))).status,409); const current=await readAutoModSettings(pool,guild); assert.equal(current.spam_limit,9); assert.deepEqual(current.blocked_words,['marutestword','bad phrase']);
+});
+test('section saves retain role session origin and audit rollback protection', async () => {
+  roles=[mod]; assert.equal((await post(sectionForm('rapid_messages'))).status,403); roles=[admin];
+  assert.equal((await post(sectionForm('blocked_words'),{ origin: 'null' })).status,403);
+  failAudit='AUTOMOD_SETTINGS_CHANGED'; assert.equal((await post(sectionForm('blocked_words'))).status,503); assert.equal((await query('SELECT * FROM automod_settings')).rows.length,0);
+  failAudit=undefined; await query("UPDATE dashboard_sessions SET expires_at=NOW()-INTERVAL '1 second'"); const expired=await post(sectionForm('exemptions')); assert.equal(expired.status,303); assert.notEqual(expired.headers.get('location'),'/automod'); assert.equal((await query('SELECT * FROM automod_settings')).rows.length,0);
+});
+test('a no-op section save does not advance revision or duplicate an audit entry', async () => {
+  assert.equal((await post(sectionForm('blocked_words'))).status,303);
+  assert.equal((await post(sectionForm('blocked_words',1))).status,303); assert.equal((await readAutoModSettings(pool,guild)).revision,1);
+  assert.equal((await query("SELECT * FROM audit_events WHERE event_type='AUTOMOD_SETTINGS_CHANGED'")).rows.length,1);
 });

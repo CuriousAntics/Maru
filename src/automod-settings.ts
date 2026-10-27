@@ -74,12 +74,10 @@ export async function saveAutoModSettings(pool: Pick<Pool,'connect'>,input: {
     if ((after.spam_enforced_role_ids ?? []).some((id) => !after.exempt_role_ids.includes(id)) || (after.spam_enforced_channel_ids ?? []).some((id) => !after.ignored_channel_ids.includes(id))) throw new AutoModError('INVALID_SELECTION');
     if (JSON.stringify(before, Object.keys(after).sort())===JSON.stringify(after,Object.keys(after).sort())) { await client.query('COMMIT'); transaction=false; return; }
     after.revision++;
-    await client.query(`INSERT INTO automod_settings (guild_id,blocked_enabled,blocked_words,timeout_seconds,exempt_role_ids,ignored_channel_ids,enforced_role_ids,enforced_channel_ids,revision,updated_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (guild_id) DO UPDATE SET blocked_enabled=$2,blocked_words=$3,timeout_seconds=$4,
-      exempt_role_ids=$5,ignored_channel_ids=$6,enforced_role_ids=$7,enforced_channel_ids=$8,revision=$9,updated_by=$10,updated_at=NOW()`,
-      [input.guildId,after.blocked_enabled,after.blocked_words,after.timeout_seconds,after.exempt_role_ids,after.ignored_channel_ids,after.enforced_role_ids,after.enforced_channel_ids,after.revision,input.actorId]);
-    await client.query(`UPDATE automod_settings SET spam_enabled=$2,spam_limit=$3,spam_window_seconds=$4,spam_timeout_seconds=$5,spam_enforced_role_ids=$6,spam_enforced_channel_ids=$7 WHERE guild_id=$1`,
-      [input.guildId,after.spam_enabled,after.spam_limit,after.spam_window_seconds,after.spam_timeout_seconds,after.spam_enforced_role_ids,after.spam_enforced_channel_ids]);
+    await client.query(`INSERT INTO automod_settings (guild_id,blocked_enabled,blocked_words,timeout_seconds,exempt_role_ids,ignored_channel_ids,enforced_role_ids,enforced_channel_ids,revision,updated_by,spam_enabled,spam_limit,spam_window_seconds,spam_timeout_seconds,spam_enforced_role_ids,spam_enforced_channel_ids)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT (guild_id) DO UPDATE SET blocked_enabled=$2,blocked_words=$3,timeout_seconds=$4,
+      exempt_role_ids=$5,ignored_channel_ids=$6,enforced_role_ids=$7,enforced_channel_ids=$8,revision=$9,updated_by=$10,updated_at=NOW(),spam_enabled=$11,spam_limit=$12,spam_window_seconds=$13,spam_timeout_seconds=$14,spam_enforced_role_ids=$15,spam_enforced_channel_ids=$16`,
+      [input.guildId,after.blocked_enabled,after.blocked_words,after.timeout_seconds,after.exempt_role_ids,after.ignored_channel_ids,after.enforced_role_ids,after.enforced_channel_ids,after.revision,input.actorId,after.spam_enabled,after.spam_limit,after.spam_window_seconds,after.spam_timeout_seconds,after.spam_enforced_role_ids,after.spam_enforced_channel_ids]);
     await client.query("INSERT INTO audit_events (guild_id,actor_id,event_type,details) VALUES ($1,$2,'AUTOMOD_SETTINGS_CHANGED',$3::jsonb)",[input.guildId,input.actorId,JSON.stringify({ before,after,reason })]);
     await client.query('COMMIT'); transaction=false;
   } catch(error) { if(transaction) { try { await client.query('ROLLBACK'); } catch { discard=true; } } throw error; }
