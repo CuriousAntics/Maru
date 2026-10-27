@@ -48,3 +48,5 @@ A claimed log is not automatically resent after response loss or an interrupted 
 Run the repository's TypeScript checks, build and full test suite including test/automod.test.ts. Automated tests use isolated PostgreSQL and fake Discord actions. They do not delete live messages or apply live timeouts.
 
 For a live development test, select a willing ordinary test member, keep staff roles exempt, add marutestword and set a short test timeout such as 1m. Enable the rule. A message containing MARUTESTWORD should be removed and logged. A longer word such as marutestwordy should remain. Five distinct matching messages from the same test member within ten minutes should create one Applied timeout case and reset their blocked-word counter. Use /untimeout if ending the test early, then restore the intended timeout duration (10m default) and list. Verify an exempt role or ignored channel remains unaffected before any production use.
+
+Rapid-message filtering is configured on the same AutoMod page. Global exemptions are shared; each rule has independent overrides, counters and timeout duration. See [rapid-message filtering](rapid-messages.md).
