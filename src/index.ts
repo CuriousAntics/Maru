@@ -1,3 +1,5 @@
+import { startHoneypotWorker } from './honeypot-worker.js';
+import { honeypotDependencies, honeypotResources } from './honeypot-discord.js';
 import { createServer } from 'node:http';
 import { Client, Events, GatewayIntentBits, MessageFlags, ChannelType, PermissionFlagsBits } from 'discord.js';
 import pg from 'pg';
@@ -63,6 +65,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    readHoneypotResources: honeypotResources(client, guildId),
     readAutoModResources: autoModResources(client, guildId),
     readStarboardResources: starboardResources(client, guildId),
     readMemberRoles: async (userId) => {
@@ -79,8 +82,11 @@ async function main(): Promise<void> {
     () => !stopping && client.isReady());
   const autoModWorker = startAutoModWorker(pool, guildId, autoModDependencies(client, guildId, token),
     () => !stopping && client.isReady());
+  const honeypotWorker = startHoneypotWorker(pool, guildId, honeypotDependencies(client, guildId, token, warningDeps),
+    () => !stopping && client.isReady());
   client.on(Events.Raw, (packet) => {
     if (stopping) return;
+    honeypotWorker.accept(packet);
     autoModWorker.accept(packet);
     const event = parseStarboardEvent(packet, guildId);
     if (event) void enqueueStarboardEvent(pool, event).catch(() => console.error('Starboard event could not be saved; observed messages will be rechecked.'));
@@ -106,7 +112,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
