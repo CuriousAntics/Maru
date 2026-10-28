@@ -75,3 +75,7 @@ export function autoModProof(token: string,revision: number): string {
 export function autoModSectionProof(token: string,revision: number,section: string): string {
   return autoModProof(`${token}:${section}`,revision);
 }
+
+export function honeypotProof(token: string,revision: number): string {
+  return createHmac('sha256',token).update(`maru-honeypot-settings:${revision}`).digest('base64url');
+}
