@@ -64,3 +64,7 @@ The Starboard navigation item opens the multiple-board settings page for configu
 ## Honeypot
 
 The Honeypot navigation item opens trap-channel settings and recent event results. Protection defaults Off. See [honeypot.md](honeypot.md) for 24-hour softbans, protected members, restart recovery, setup and the consolidated deferred live checklist.
+
+## Community roles
+
+The Community roles page configures Nomad, permanent Community, message/voice activity and preservation of current role holders. Tracking, automatic role changes and privileged event intake default Off. See [community-roles.md](community-roles.md) for setup, persistence, deferred validation and the still-pending StatBot progress migration.
