@@ -1,3 +1,5 @@
+import { startCommunityWorker } from './community-worker.js';
+import { communityDependencies, communityResources, communityVoiceSnapshot } from './community-discord.js';
 import { startHoneypotWorker } from './honeypot-worker.js';
 import { honeypotDependencies, honeypotResources } from './honeypot-discord.js';
 import { createServer } from 'node:http';
@@ -34,7 +36,9 @@ async function main(): Promise<void> {
     idleTimeoutMillis: 30000,
     query_timeout: 5000,
   });
-  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent] });
+  const communityEvents = process.env.COMMUNITY_EVENTS_ENABLED === 'true';
+  let communityConnected = false;
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent, ...(communityEvents ? [GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates] : [])] });
   let stopping = false;
   let webConfig;
   try { webConfig = dashboardConfig(process.env); }
@@ -65,6 +69,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    readCommunityResources: communityResources(client, guildId, communityEvents),
     readHoneypotResources: honeypotResources(client, guildId),
     readAutoModResources: autoModResources(client, guildId),
     readStarboardResources: starboardResources(client, guildId),
@@ -84,8 +89,25 @@ async function main(): Promise<void> {
     () => !stopping && client.isReady());
   const honeypotWorker = startHoneypotWorker(pool, guildId, honeypotDependencies(client, guildId, token, warningDeps),
     () => !stopping && client.isReady());
+  const communityWorker = startCommunityWorker(pool, guildId, communityDependencies(client, guildId, token), {
+    isReady: () => communityEvents && communityConnected && !stopping && client.isReady(),
+    snapshot: () => communityVoiceSnapshot(client, guildId),
+    readParent: async (id) => {
+      const guild = await client.guilds.fetch(guildId);
+      const channel = guild.channels.cache.get(id) ?? await guild.channels.fetch(id);
+      if (!channel) throw new Error('CHANNEL_UNAVAILABLE');
+      return channel.isThread() ? channel.parentId : null;
+    },
+  });
+  client.on(Events.VoiceStateUpdate, (_old, state) => { if (state.guild.id === guildId) communityWorker.voiceChanged(); });
+  client.on(Events.ShardDisconnect, () => { communityConnected = false; communityWorker.resetVoice(); });
+  client.on(Events.ShardReconnecting, () => { communityConnected = false; communityWorker.resetVoice(); });
+  client.on(Events.ShardResume, () => { communityConnected = true; communityWorker.resetVoice(); });
+  client.on(Events.GuildUnavailable, (guild) => { if (guild.id === guildId) { communityConnected = false; communityWorker.resetVoice(); } });
+  client.on(Events.GuildAvailable, (guild) => { if (guild.id === guildId) { communityConnected = true; communityWorker.resetVoice(); } });
   client.on(Events.Raw, (packet) => {
     if (stopping) return;
+    communityWorker.accept(packet);
     honeypotWorker.accept(packet);
     autoModWorker.accept(packet);
     const event = parseStarboardEvent(packet, guildId);
@@ -112,7 +134,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
@@ -124,7 +146,7 @@ async function main(): Promise<void> {
 
   pool.on('error', () => console.error('PostgreSQL connection error. Check host status and network access.'));
   client.on(Events.Error, () => console.error('Discord client error. Check connection status.'));
-  client.once(Events.ClientReady, () => console.log('Maru is connected to Discord.'));
+  client.once(Events.ClientReady, () => { communityConnected = true; communityWorker.resetVoice(); console.log('Maru is connected to Discord.'); });
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (!['ping', 'staff-check', 'staff-access', 'warn', 'case', 'timeout', 'untimeout', 'ban', 'unban'].includes(interaction.commandName)) return;

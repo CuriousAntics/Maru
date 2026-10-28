@@ -1,3 +1,5 @@
+import { handleCommunityPage } from './community-web.js';
+import type { CommunityResources } from './community-settings.js';
 import { handleHoneypotPage } from './honeypot-web.js';
 import type { HoneypotResources } from './honeypot-settings.js';
 import { handleAutoModPage } from './automod-web.js';
@@ -28,6 +30,7 @@ type Options = {
   isBotReady: () => boolean;
   readMemberRoles: (userId: string) => Promise<string[] | null>;
   readLogChannels?: () => Promise<LogChannel[]>;
+  readCommunityResources?: () => Promise<CommunityResources>;
   readHoneypotResources?: () => Promise<HoneypotResources>;
   readAutoModResources?: () => Promise<AutoModResources>;
   sendTestMessage?: SendTestMessage;
@@ -78,7 +81,7 @@ export function createDashboardHandler(options: Options) {
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
-    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot'];
+    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community'];
     const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save|delete|delete-confirm))?)?$/.test(path);
     const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save|delete)$/.test(path);
     const caseDetail = /^\/cases\/([^/]+)$/.exec(path);
@@ -91,7 +94,7 @@ export function createDashboardHandler(options: Options) {
       message(response, 503, 'Dashboard setup pending', 'Dashboard sign-in has not been configured yet.');
       return;
     }
-    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : ['/settings','/automod','/honeypot'].includes(path) ? 'GET, POST' : 'GET';
+    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : ['/settings','/automod','/honeypot','/community'].includes(path) ? 'GET, POST' : 'GET';
     if (!expectedMethod.split(', ').includes(request.method ?? '')) {
       response.setHeader('Allow', expectedMethod);
       message(response, 405, 'Method not allowed', 'Use the dashboard controls to continue.');
@@ -265,6 +268,13 @@ export function createDashboardHandler(options: Options) {
       response.setHeader('Set-Cookie', cookie(sessionName, '', 0, config.secure));
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
       return;
+    }
+    if (path === '/community') {
+      if (!options.readCommunityResources) throw new Error('COMMUNITY_RESOURCES_UNAVAILABLE');
+      await handleCommunityPage(request,{ pool,guildId,actorId: session.user_id,token: sessionToken,origin: config.origin,access,
+        readRoles: readMemberRoles,readResources: options.readCommunityResources },{
+        html: (status,render) => html(response,status,render),redirect: (location) => redirect(response,location),
+      }); return;
     }
     if (path === '/honeypot') {
       if (!options.readHoneypotResources) throw new Error('HONEYPOT_RESOURCES_UNAVAILABLE');
