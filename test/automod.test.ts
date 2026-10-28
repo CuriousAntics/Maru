@@ -17,6 +17,7 @@ import { autoModDependencies, imageUploads } from '../src/automod-discord.js';
 import { createImageFingerprinter, trustedImageUrl, imageByteLimit, messageImageByteLimit } from '../src/image-fingerprints.js';
 import type { AutoModImage } from '../src/image-fingerprints.js';
 import { repeatedTextKey } from '../src/repeated-messages.js';
+import { inviteCodes, parseApprovedServers } from '../src/discord-invites.js';
 import { caseSummary } from '../src/handle-warning.js';
 import type { WarningCase } from '../src/warnings.js';
 
@@ -27,6 +28,8 @@ const actor='300000000000000001',member='300000000000000002',bot='30000000000000
 const channel='500000000000000001',logs='500000000000000002',otherChannel='500000000000000003';
 let messageId=600000000000000000n;
 let token=randomToken(),roles: string[] | null,resources: AutoModResources;
+let inviteDestinations=new Map<string,string | null>(),inviteLookups: string[]=[];
+let inviteHook: ((code: string) => Promise<string | null>) | undefined;
 let connectHook: (() => Promise<void>) | undefined;
 let failAudit: string | undefined,failClaim=false,busy=false,failUnlock=false,discarded=false,transaction=false;
 async function query(sql: string,values?: unknown[]) {
@@ -54,7 +57,7 @@ let nativeFailure: 'network'|'forbidden'|'after'|undefined,logFailure: 'network'
 let deleteFailure: 'before'|'after'|undefined;
 let actions: { user: string; until: string; number: number }[],sent: RESTPostAPIChannelMessageJSONBody[],deletes: string[];
 let contextHook: (() => Promise<void>) | undefined;
-const deps: AutoModDependencies={ imageFingerprints: async (value) => fingerprintImages(value),botId: () => bot,
+const deps: AutoModDependencies={ resolveInvite: async (code) => { inviteLookups.push(code); return inviteHook?inviteHook(code):inviteDestinations.get(code) ?? null; },imageFingerprints: async (value) => fingerprintImages(value),botId: () => bot,
   readMessage: async (_channel,id) => messages.get(id) ?? null,
   readContext: async () => { await contextHook?.(); return { ...context }; },
   deleteMessage: async (_channel,id) => { assert.equal(transaction,false); deletes.push(id); if(deleteFailure==='before') throw new Error('delete network failure'); messages.delete(id); if(deleteFailure==='after') throw new Error('delete response lost'); },
@@ -82,18 +85,18 @@ async function request(path: string,init: RequestInit={}) { return fetch(base+pa
 function form(overrides: Record<string,string>={}) { return new URLSearchParams({ csrf: autoModProof(token,0),revision: '0',enabled: 'true',words: 'marutestword',timeout: '10m',reason: 'Enable test rule',exempt_role: admin,...overrides }); }
 async function post(body: URLSearchParams | string=form(),headers: Record<string,string>={}) { return request('/automod',{ method: 'POST',body,headers: { origin: base,'content-type': 'application/x-www-form-urlencoded',...headers } }); }
 before(async () => {
-  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql','011_rapid_messages.sql','012_repeated_messages.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql','011_rapid_messages.sql','012_repeated_messages.sql','013_discord_invites.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
   await new Promise<void>((resolve) => server.listen(0,'127.0.0.1',resolve)); base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
-  connectHook=undefined; failAudit=undefined; failClaim=busy=failUnlock=discarded=transaction=false; readHook=contextHook=undefined;
+  inviteDestinations=new Map(); inviteLookups=[]; inviteHook=undefined; connectHook=undefined; failAudit=undefined; failClaim=busy=failUnlock=discarded=transaction=false; readHook=contextHook=undefined;
   imageData=new Map(); imageRequests=[]; fingerprintImages=createImageFingerprinter((async (url) => { const address=String(url); imageRequests.push(address); const bytes=imageData.get(new URL(address).pathname.split('/')[3]!); if(!bytes) throw new Error('Image unavailable'); return new Response(Buffer.from(bytes)); }) as typeof fetch);
   nativeFailure=logFailure=deleteFailure=undefined; actions=[]; sent=[]; deletes=[]; messages=new Map(); token=randomToken(); roles=[admin]; ready=true;
   resources={ roles: [{ id: admin,name: 'Admin' },{ id: mod,name: 'Mods' },{ id: community,name: 'Community Manager' }],
     channels: [{ id: channel,name: 'general' },{ id: logs,name: 'logs' },{ id: otherChannel,name: 'finished-work' }],canDelete: true,canTimeout: true };
   context={ guildName: 'Maru Development',roleIds: [],parentId: null,owner: false,canDelete: true,canTimeout: true,timeoutUntil: null };
   await db.exec('SELECT pg_advisory_unlock_all()');
-  await db.exec('TRUNCATE automod_repeat_activity,automod_message_activity,automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
+  await db.exec('TRUNCATE automod_invite_reviews,automod_repeat_activity,automod_message_activity,automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
   await query('INSERT INTO guild_settings (guild_id,settings) VALUES ($1,$3::jsonb),($2,$3::jsonb)',[guild,otherGuild,JSON.stringify({ moderation_log_channel_id: logs })]);
   await query("INSERT INTO staff_roles (guild_id,role_id,access_level) VALUES ($1,$2,'admin'),($1,$3,'moderator')",[guild,admin,mod]);
   await query("INSERT INTO dashboard_sessions (token_hash,guild_id,user_id,display_name,expires_at) VALUES ($1,$2,$3,'Staff',NOW()+INTERVAL '1 hour')",[digest(token),guild,actor]);
@@ -535,16 +538,17 @@ function sectionForm(section: string,revision=0,overrides: Record<string,string>
   const defaults: Record<string,Record<string,string>>={ blocked_words: { enabled: 'true',words: 'newword, another phrase',timeout: '2m' },rapid_messages: { spam_enabled: 'true',spam_limit: '3',spam_window: '8',spam_timeout: '1m' },exemptions: { exempt_role: admin,ignored_channel: otherChannel } };
   return new URLSearchParams({ section,revision: String(revision),csrf: autoModSectionProof(token,revision,section),reason: 'Save this section',...defaults[section],...overrides });
 }
-test('AutoMod renders four independent forms with distinct save buttons and section proofs', async () => {
+test('AutoMod renders five independent forms with distinct save buttons and section proofs', async () => {
   const html=await (await request('/automod')).text(); const forms=[...html.matchAll(/<form method="post" action="\/automod">([\s\S]*?)<\/form>/g)].map((match) => match[1]!);
-  assert.equal(forms.length,4);
-  for(const [index,section] of ['blocked_words','rapid_messages','repeated_messages','exemptions'].entries()) {
+  assert.equal(forms.length,5);
+  for(const [index,section] of ['blocked_words','rapid_messages','repeated_messages','discord_invites','exemptions'].entries()) {
     assert.ok(forms[index]!.includes(`name="section" value="${section}"`)); assert.ok(forms[index]!.includes(autoModSectionProof(token,0,section))); assert.ok(forms[index]!.includes('name="reason"'));
   }
   assert.match(forms[0]!,/Save blocked words/); assert.ok(!forms[0]!.includes('name="spam_limit"')); assert.ok(!forms[0]!.includes('name="exempt_role"'));
   assert.match(forms[1]!,/Save rapid messaging/); assert.ok(!forms[1]!.includes('name="words"'));
   assert.match(forms[2]!,/Save repeated messages/); assert.ok(!forms[2]!.includes('name="words"'));
-  assert.match(forms[3]!,/Save shared exemptions/); assert.ok(!forms[3]!.includes('name="enabled"'));
+  assert.match(forms[3]!,/Save Discord invites/);
+  assert.match(forms[4]!,/Save shared exemptions/); assert.ok(!forms[3]!.includes('name="enabled"'));
 });
 test('saving blocked words preserves every rapid-message setting and shared exemption', async () => {
   await spamSave({ enabled: true,spamLimit: 7,spamWindowSeconds: 12,spamTimeoutSeconds: 120,ignoredChannels: [otherChannel],spamEnforcedRoles: [mod],spamEnforcedChannels: [otherChannel] });
@@ -764,4 +768,137 @@ test('repetition overrides cannot change rapid-message or blocked-word exemption
   let current=await readAutoModSettings(pool,guild); assert.deepEqual(current.spam_enforced_role_ids,[]); assert.deepEqual(current.spam_enforced_channel_ids,[]); assert.deepEqual(current.enforced_role_ids,[]); assert.deepEqual(current.enforced_channel_ids,[]);
   assert.equal(autoModExempt(current,[mod],channel,null,'rapid_messages'),true); assert.equal(autoModExempt(current,[mod],channel,null,'repeated_messages'),false);
   assert.equal((await post(sectionForm('rapid_messages',1))).status,303); current=await readAutoModSettings(pool,guild); assert.deepEqual(current.repeat_enforced_role_ids,[mod]); assert.deepEqual(current.repeat_enforced_channel_ids,[otherChannel]);
+});
+
+const foreignServer='700000000000000001',approvedServer='700000000000000002';
+async function inviteSave(overrides: Record<string,unknown>={}) { await save({ enabled: false,inviteEnabled: true,inviteTimeoutSeconds: 600,inviteAllowedGuilds: [],inviteEnforcedRoles: [],inviteEnforcedChannels: [],...overrides }); }
+function inviteForm(revision=0,overrides: Record<string,string>={}) { return new URLSearchParams({ section: 'discord_invites',revision: String(revision),csrf: autoModSectionProof(token,revision,'discord_invites'),reason: 'Configure invite filtering',invite_enabled: 'true',invite_allowed_guilds: approvedServer,invite_timeout: '10m',...overrides }); }
+async function inviteReviews() { return (await query('SELECT * FROM automod_invite_reviews ORDER BY message_id')).rows as Record<string,unknown>[]; }
+async function inviteViolations() { return (await violations()).filter((v) => v.rule_key==='discord_invites'); }
+function inviteMessage(code='BadInvite') { return message(`Invitation: https://discord.gg/${code}`); }
+test('invite parser recognizes official link forms markdown query strings trailing punctuation and preserves code case', () => {
+  for(const url of ['https://discord.gg/AbC-123','discord.gg/AbC-123','www.discord.gg/AbC-123','https://discord.com/invite/AbC-123','https://discordapp.com/invite/AbC-123','https://canary.discord.com/invite/AbC-123','https://ptb.discord.com/invite/AbC-123/','[join](https://discord.gg/AbC-123?event=1)']) assert.deepEqual(inviteCodes(url),['AbC-123'],url);
+  assert.deepEqual(inviteCodes('discord.gg/abc, discord.gg/abc and DISCORD.GG/ABC.'),['abc','ABC']);
+  assert.deepEqual(parseApprovedServers(`${approvedServer}, ${foreignServer}\n${approvedServer}`),[foreignServer,approvedServer]); assert.throws(() => parseApprovedServers('not-a-server'));
+});
+test('invite parser ignores lookalike domains credential URLs other websites and unsupported paths', () => {
+  for(const text of ['https://discord.gg.evil.test/abc','https://evil.test/discord.gg/abc','https://discord.gg@evil.test/abc','https://notdiscord.gg/abc','https://evil-discord.gg/abc','https://discord.com/channels/abc','https://discord.gg/abc/other','https://discord.gg/abc%2Fother','https://discord.gg/abc.fake','https://discord.gg/abc:extra']) assert.deepEqual(inviteCodes(text),[],text);
+});
+test('invite defaults Off with a ten-minute timeout and preserves messages until enabled', async () => {
+  const initial=await readAutoModSettings(pool,guild); assert.equal(initial.invite_enabled,false); assert.equal(initial.invite_timeout_seconds,600);
+  inviteDestinations.set('BadInvite',foreignServer); await run(inviteMessage()); assert.equal(inviteLookups.length,0); assert.equal(deletes.length,0);
+});
+test('own-server invites and all invites to an approved server stay without violations or review logs', async () => {
+  await inviteSave({ inviteAllowedGuilds: [approvedServer] }); inviteDestinations.set('Own',guild); inviteDestinations.set('Approved1',approvedServer); inviteDestinations.set('Approved2',approvedServer);
+  for(const code of ['Own','Approved1','Approved2']) await run(inviteMessage(code)); assert.equal(deletes.length,0); assert.equal(sent.length,0); assert.equal((await violations()).length,0); assert.equal((await inviteReviews()).length,0);
+});
+test('a verified unapproved invite is removed once and logged without copying message text or pinging staff', async () => {
+  await inviteSave(); inviteDestinations.set('BadInvite',foreignServer); const value=await run(inviteMessage());
+  assert.equal(messages.has(value.id),false); assert.equal(deletes.length,1); assert.equal(inviteLookups.length,1); assert.equal((await inviteViolations())[0]!.violation_count,1);
+  assert.equal(sent[0]!.embeds![0]!.title,'Discord-invite violation'); assert.deepEqual(sent[0]!.allowed_mentions,{ parse: [] }); assert.ok(!JSON.stringify(sent).includes('Invitation:'));
+});
+test('an unknown invite stays and is logged for review without any counter or moderation case', async () => {
+  await inviteSave(); const value=await run(inviteMessage('Unknown')); assert.equal(messages.has(value.id),true); assert.equal(deletes.length,0); assert.equal(actions.length,0);
+  assert.equal((await cases()).length,0); assert.equal((await violations()).length,0); assert.equal((await query('SELECT * FROM automod_counters')).rows.length,0);
+  assert.equal(sent.length,1); assert.equal(sent[0]!.embeds![0]!.title,'Discord invite: review needed'); assert.deepEqual(sent[0]!.allowed_mentions,{ parse: [] }); assert.equal((await inviteReviews())[0]!.log_status,'sent');
+});
+test('resolver failures expired invalid and non-server destinations are review-only and do not punish', async () => {
+  await inviteSave(); inviteHook=async () => { throw new Error('private resolver failure'); };
+  for(let i=0;i<6;i++) await run(inviteMessage('Expired')); assert.equal(deletes.length,0); assert.equal(actions.length,0); assert.equal((await violations()).length,0); assert.equal((await inviteReviews()).length,6);
+});
+test('multiple unapproved invites in one message count as one violation; unknowns cannot excuse a known unapproved invite', async () => {
+  await inviteSave(); inviteDestinations.set('Bad1',foreignServer); inviteDestinations.set('Bad2',foreignServer);
+  await run(message('discord.gg/Bad1 discord.gg/Unknown discord.gg/Bad2')); assert.equal(deletes.length,1); assert.equal((await inviteViolations()).length,1); assert.equal((await inviteViolations())[0]!.violation_count,1); assert.equal((await inviteReviews()).length,0);
+});
+test('five invite violations trigger one native timeout and reset only their own rule counter', async () => {
+  await inviteSave({ enabled: true,inviteTimeoutSeconds: 60 }); await run(message()); inviteDestinations.set('BadInvite',foreignServer); for(let i=0;i<5;i++) await run(inviteMessage());
+  assert.equal(actions.length,1); const record=(await cases())[0]!; assert.equal(record.duration_seconds,60); assert.equal(record.origin,'automod'); assert.equal(record.dm_status,'skipped'); assert.match(record.reason,/unapproved-invite/);
+  assert.equal((await inviteViolations()).at(-1)!.violation_count,5); const counters=(await query('SELECT rule_key FROM automod_counters ORDER BY rule_key')).rows as { rule_key: string }[]; assert.deepEqual(counters.map((row) => row.rule_key),['blocked_words','discord_invites']);
+});
+test('exempt staff bots webhooks owner and ignored thread parents do not resolve or log invites', async () => {
+  await inviteSave({ ignoredChannels: [otherChannel] }); context.roleIds=[mod]; await run(inviteMessage()); context.roleIds=[]; context.parentId=otherChannel; await run(inviteMessage()); context.parentId=null;
+  const botMessage=inviteMessage(); botMessage.bot=true; await run(botMessage); const hookMessage=inviteMessage(); hookMessage.webhook=true; await run(hookMessage); context.owner=true; await run(inviteMessage());
+  assert.equal(inviteLookups.length,0); assert.equal(sent.length,0); assert.equal(deletes.length,0);
+});
+test('invite-rule overrides remain independent and cannot bypass ignored channels', async () => {
+  await inviteSave({ inviteEnforcedRoles: [mod],ignoredChannels: [otherChannel] }); inviteDestinations.set('BadInvite',foreignServer); context.roleIds=[mod]; await run(inviteMessage()); assert.equal(deletes.length,1);
+  context.parentId=otherChannel; await run(inviteMessage()); assert.equal(deletes.length,1);
+  const current=await readAutoModSettings(pool,guild); assert.deepEqual(current.spam_enforced_role_ids,[]); assert.deepEqual(current.repeat_enforced_role_ids,[]); assert.deepEqual(current.enforced_role_ids,[]);
+});
+test('duplicate events do not resend unknown-invite review logs', async () => {
+  await inviteSave(); const value=await run(inviteMessage('Unknown')); for(let i=0;i<3;i++) await run(value); assert.equal(sent.length,1); assert.equal((await inviteReviews()).length,1); assert.equal((await violations()).length,0);
+});
+test('an edited previously unverified message can become a verified violation without duplicating its review', async () => {
+  await inviteSave(); const value=await run(inviteMessage('Unknown')); value.content='https://discord.gg/BadInvite'; inviteDestinations.set('BadInvite',foreignServer); await run(value);
+  assert.equal(deletes.length,1); assert.equal((await inviteReviews()).length,1); assert.equal((await inviteViolations()).length,1); assert.equal(sent.length,2); assert.notEqual(sent[0]!.nonce,sent[1]!.nonce);
+});
+test('an invite removed or changed to an approved destination before dispatch avoids a stale deletion', async () => {
+  await inviteSave({ inviteAllowedGuilds: [approvedServer] }); inviteDestinations.set('BadInvite',foreignServer); inviteDestinations.set('Approved',approvedServer); const value=inviteMessage();
+  inviteHook=async (code) => { if(code==='BadInvite') value.content='https://discord.gg/Approved'; return inviteDestinations.get(code) ?? null; }; await run(value); assert.equal(deletes.length,0); assert.equal(actions.length,0);
+});
+test('confirmed unapproved invite deletion requires fresh channel permissions and is safely retried', async () => {
+  await inviteSave(); inviteDestinations.set('BadInvite',foreignServer); context.canDelete=false; await run(inviteMessage()); assert.equal(deletes.length,0); assert.equal((await inviteViolations()).length,0);
+  context.canDelete=true; await retry(); assert.equal(deletes.length,1);
+});
+test('unknown reviews still leave messages when channel deletion permissions are unavailable', async () => {
+  await inviteSave(); context.canDelete=false; const value=await run(inviteMessage('Unknown')); assert.equal(messages.has(value.id),true); assert.equal(sent.length,1); assert.equal((await violations()).length,0);
+});
+test('review audit failure prevents the external review send and recovery remains idempotent', async () => {
+  await inviteSave(); failAudit='AUTOMOD_INVITE_REVIEW'; await run(inviteMessage('Unknown')); assert.equal(sent.length,0); assert.equal((await inviteReviews()).length,0);
+  failAudit=undefined; await retry(); assert.equal(sent.length,1); await retry(); assert.equal(sent.length,1);
+});
+test('lost review log response stays unconfirmed and never automatically resends or deletes the source', async () => {
+  await inviteSave(); logFailure='network'; const value=await run(inviteMessage('Unknown')); assert.equal((await inviteReviews())[0]!.log_status,'unconfirmed'); logFailure=undefined; await run(value);
+  assert.equal(sent.length,1); assert.equal(messages.has(value.id),true); assert.equal(deletes.length,0);
+});
+test('review outcome audit failure preserves the send claim without replaying it', async () => {
+  await inviteSave(); failAudit='AUTOMOD_INVITE_REVIEW_LOG'; const value=await run(inviteMessage('Unknown')); assert.equal(sent.length,1); assert.equal((await inviteReviews())[0]!.log_status,'sending');
+  failAudit=undefined; await retry(); await run(value); assert.equal(sent.length,1); assert.equal((await violations()).length,0);
+});
+test('unapproved-invite action audit and native timeout response loss do not dispatch duplicate punishments', async () => {
+  await inviteSave(); inviteDestinations.set('BadInvite',foreignServer); failAudit='AUTOMOD_DISCORD_INVITE'; await run(inviteMessage()); assert.equal(deletes.length,0); failAudit=undefined; await retry();
+  nativeFailure='network'; for(let i=0;i<5;i++) await run(inviteMessage()); assert.equal(actions.length,1); assert.equal((await cases())[0]!.action_status,'unconfirmed');
+});
+test('approved-list changes and disabled rules stop saved invite work before deletion', async () => {
+  await inviteSave(); inviteDestinations.set('BadInvite',foreignServer); const value=inviteMessage(); await enqueue(value); await save({ enabled: false,revision: 1,inviteAllowedGuilds: [foreignServer] }); await processAutoModJob(pool,guild,deps); assert.equal(deletes.length,0);
+  await enqueue(inviteMessage('Unknown')); await save({ enabled: false,revision: 2,inviteEnabled: false }); await processAutoModJob(pool,guild,deps); assert.equal(sent.length,0);
+});
+test('invite reviews and counters remain scoped to the configured server', async () => {
+  await inviteSave(); await run(inviteMessage('Unknown')); const foreign=(await query('SELECT * FROM automod_invite_reviews WHERE guild_id=$1',[otherGuild])).rows; assert.equal(foreign.length,0); assert.equal((await cases()).length,0);
+});
+test('review messages do not suppress other independent moderation rules', async () => {
+  await inviteSave({ enabled: true }); await run(message('marutestword discord.gg/Unknown')); assert.equal(deletes.length,1); assert.equal((await inviteViolations()).length,0); assert.equal((await inviteReviews()).length,1); assert.equal((await violations()).length,1);
+});
+test('invite lookup work is capped and remaining destinations are left for review', async () => {
+  await inviteSave({ inviteAllowedGuilds: [approvedServer] }); for(let i=0;i<12;i++) inviteDestinations.set(`Code${i}`,approvedServer);
+  const value=await run(message(Array.from({ length: 12 },(_,i) => `discord.gg/Code${i}`).join(' '))); assert.equal(inviteLookups.length,10); assert.equal(messages.has(value.id),true); assert.equal((await inviteReviews()).length,1);
+});
+test('invite settings have an independent save proof and preserve every other rule', async () => {
+  await repeatSave({ enabled: true,spamEnabled: true,repeatEnforcedRoles: [mod],spamEnforcedRoles: [mod] }); const before=await readAutoModSettings(pool,guild);
+  assert.equal((await post(inviteForm(1))).status,303); const after=await readAutoModSettings(pool,guild); assert.equal(after.invite_enabled,true); assert.equal(after.invite_timeout_seconds,600); assert.deepEqual(after.invite_allowed_guild_ids,[approvedServer]);
+  for(const key of ['blocked_enabled','blocked_words','timeout_seconds','spam_enabled','spam_limit','spam_enforced_role_ids','repeat_enabled','repeat_limit','repeat_enforced_role_ids','exempt_role_ids','ignored_channel_ids'] as const) assert.deepEqual(after[key],before[key]);
+  assert.equal((await post(inviteForm(2,{ csrf: autoModSectionProof(token,2,'repeated_messages') }))).status,403); assert.equal((await post(inviteForm(2,{ words: 'unrelated' }))).status,400);
+});
+test('shared-exemption saves prune invite overrides without changing approval or timeout settings', async () => {
+  await inviteSave({ inviteAllowedGuilds: [approvedServer],inviteEnforcedRoles: [mod],ignoredChannels: [otherChannel],inviteEnforcedChannels: [otherChannel] }); const form=sectionForm('exemptions',1); form.delete('ignored_channel'); assert.equal((await post(form)).status,303);
+  const after=await readAutoModSettings(pool,guild); assert.deepEqual(after.invite_enforced_role_ids,[]); assert.deepEqual(after.invite_enforced_channel_ids,[]); assert.deepEqual(after.invite_allowed_guild_ids,[approvedServer]); assert.equal(after.invite_enabled,true);
+});
+test('invite configuration validates approved IDs permissions sessions and mode-specific input', async () => {
+  assert.equal((await post(inviteForm(0,{ invite_allowed_guilds: 'https://discord.gg/invite' }))).status,400); assert.equal((await post(inviteForm(0,{ invite_timeout: '29d' }))).status,400);
+  roles=[mod]; assert.equal((await post(inviteForm())).status,403); roles=[admin]; resources.canDelete=false; assert.equal((await post(inviteForm())).status,400); resources.canDelete=true;
+  failAudit='AUTOMOD_SETTINGS_CHANGED'; assert.equal((await post(inviteForm())).status,503); assert.equal((await query('SELECT * FROM automod_settings')).rows.length,0);
+});
+test('invite review list is staff-only and displays review delivery separately from violations', async () => {
+  await inviteSave(); await run(inviteMessage('Unknown')); let html=await (await request('/automod')).text(); assert.match(html,/Invite reviews/); assert.match(html,/review records are not violations/); assert.match(html,/Unknown/);
+  assert.equal((await request('/automod',{ headers: { cookie: '' } })).status,303); roles=[mod]; html=await (await request('/automod')).text(); assert.match(html,/Invite reviews/); assert.ok(!html.includes('Save Discord invites'));
+});
+test('Discord resolver uses the invite GET endpoint and never joins or deletes an invite', async () => {
+  const calls: string[]=[]; const writer={ get: async (route: string,options: { signal: AbortSignal }) => { calls.push(route); assert.ok(options.signal); return { code: 'Good',guild: { id: approvedServer } }; } } as unknown as Pick<REST,'get'|'delete'|'patch'|'post'>;
+  const adapter=autoModDependencies({ user: { id: bot } } as Client,guild,'test-token',writer); assert.equal(await adapter.resolveInvite!('Good'),approvedServer); assert.deepEqual(calls,['/invites/Good']);
+});
+test('Discord resolver treats mismatched invalid non-server and failed responses as unverified', async () => {
+  for(const result of [{ code: 'Other',guild: { id: approvedServer } },{ code: 'Good' },{ code: 'Good',guild: { id: 'invalid' } }]) {
+    const adapter=autoModDependencies({ user: { id: bot } } as Client,guild,'test-token',{ get: async () => result } as unknown as Pick<REST,'get'|'delete'|'patch'|'post'>); assert.equal(await adapter.resolveInvite!('Good'),null);
+  }
+  const adapter=autoModDependencies({ user: { id: bot } } as Client,guild,'test-token',{ get: async () => { throw Object.assign(new Error('Expired'),{ status: 404 }); } } as unknown as Pick<REST,'get'|'delete'|'patch'|'post'>); assert.equal(await adapter.resolveInvite!('Good'),null);
 });

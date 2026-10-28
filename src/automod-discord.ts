@@ -1,5 +1,5 @@
 import { ChannelType, PermissionFlagsBits, REST, Routes } from 'discord.js';
-import type { APIAttachment, APIMessage, Client, RESTPatchAPIGuildMemberResult } from 'discord.js';
+import type { APIAttachment, APIInvite, APIMessage, Client, RESTPatchAPIGuildMemberResult } from 'discord.js';
 import { createImageFingerprinter } from './image-fingerprints.js';
 import { AutoModError } from './automod-settings.js';
 import type { AutoModResources } from './automod-settings.js';
@@ -19,7 +19,12 @@ export function autoModResources(client: Client,guildId: string): () => Promise<
 export function autoModDependencies(client: Client,guildId: string,token: string,writerOverride?: Pick<REST,'get'|'delete'|'patch'|'post'>): AutoModDependencies {
   const writer=writerOverride ?? new REST({ version: '10',retries: 0,timeout: 15000 }).setToken(token);
   const botId=() => { if(!client.user) throw new AutoModError('BOT_NOT_READY'); return client.user.id; };
-  return { botId,imageFingerprints: createImageFingerprinter(),
+  return { botId,resolveInvite: async (code) => {
+    try {
+      const invite=await writer.get(Routes.invite(code),{ signal: AbortSignal.timeout(3000) }) as APIInvite;
+      return invite.code===code && /^\d{17,20}$/.test(invite.guild?.id ?? '')?invite.guild!.id:null;
+    } catch { return null; }
+  },imageFingerprints: createImageFingerprinter(),
     readMessage: async (channel,id) => {
       try { const source=await writer.get(Routes.channelMessage(channel,id),{ signal: AbortSignal.timeout(15000) }) as APIMessage;
         if(source.id!==id || source.channel_id!==channel || !source.author?.id || typeof source.content!=='string') throw new AutoModError('INVALID_MESSAGE');

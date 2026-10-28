@@ -1,5 +1,6 @@
 import type { Pool } from 'pg';
 import { readAutoModSettings, AutoModError } from './automod-settings.js';
+import { inviteCodes } from './discord-invites.js';
 import { matchBlockedWords } from './blocked-words.js';
 import { processAutoModMessage } from './automod-engine.js';
 import type { AutoModDependencies, AutoModJob } from './automod-engine.js';
@@ -15,8 +16,8 @@ export function parseAutoModEvent(packet: { t?: string | null; d: unknown },guil
   return { messageId: data.id!,channelId: data.channel_id!,content: data.content,eventAt,createdAt: packet.t==='MESSAGE_CREATE'?eventAt:undefined,isCreate: packet.t==='MESSAGE_CREATE' };
 }
 export async function enqueueAutoModCandidates(pool: Pick<Pool,'query'>,guildId: string,events: AutoModEvent[]): Promise<void> {
-  const settings=await readAutoModSettings(pool,guildId); if(!settings.blocked_enabled && !settings.spam_enabled && !settings.repeat_enabled) return;
-  for(const event of events) if((settings.spam_enabled || settings.repeat_enabled) && event.isCreate || settings.blocked_enabled && matchBlockedWords(event.content,settings.blocked_words).length) {
+  const settings=await readAutoModSettings(pool,guildId); if(!settings.blocked_enabled && !settings.spam_enabled && !settings.repeat_enabled && !settings.invite_enabled) return;
+  for(const event of events) if(settings.invite_enabled && inviteCodes(event.content).length ||(settings.spam_enabled || settings.repeat_enabled) && event.isCreate || settings.blocked_enabled && matchBlockedWords(event.content,settings.blocked_words).length) {
     await pool.query(`INSERT INTO automod_jobs (guild_id,message_id,channel_id,event_at,is_create,created_at,spam_revision,repeat_revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       ON CONFLICT (guild_id,message_id) DO UPDATE SET version=automod_jobs.version+1,event_at=EXCLUDED.event_at,available_at=NOW(),repeat_revision=CASE WHEN automod_jobs.is_create THEN automod_jobs.repeat_revision ELSE EXCLUDED.repeat_revision END,spam_revision=CASE WHEN automod_jobs.is_create THEN automod_jobs.spam_revision ELSE EXCLUDED.spam_revision END,is_create=automod_jobs.is_create OR EXCLUDED.is_create,created_at=COALESCE(automod_jobs.created_at,EXCLUDED.created_at)`,[guildId,event.messageId,event.channelId,event.eventAt,!!event.isCreate,event.createdAt ?? (event.isCreate?event.eventAt:null),settings.spam_enabled && event.isCreate?settings.revision:null,settings.repeat_enabled && event.isCreate?settings.revision:null]);
   }
