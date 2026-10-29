@@ -1,3 +1,4 @@
+import { createScamFeed, startScamFeedWorker } from './scam-feed.js';
 import { raidDependencies } from './raid-discord.js';
 import { startRaidWorker } from './raid-worker.js';
 import { startCommunityWorker } from './community-worker.js';
@@ -61,6 +62,7 @@ async function main(): Promise<void> {
   const warningDeps = warningDependencies(client, guildId, readLogChannels);
   const timeoutDeps = timeoutDependencies(client, guildId, token, warningDeps);
   const banDeps = banDependencies(client, guildId, token, warningDeps);
+  const scamFeed = createScamFeed(pool);
   const raidDeps = raidDependencies(client, guildId, token, communityEvents);
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
@@ -73,6 +75,7 @@ async function main(): Promise<void> {
     },
     readLogChannels,
     raidDependencies: raidDeps,
+    scamFeedStatus: scamFeed.status,
     readCommunityResources: communityResources(client, guildId, communityEvents),
     readHoneypotResources: honeypotResources(client, guildId),
     readAutoModResources: autoModResources(client, guildId),
@@ -89,10 +92,11 @@ async function main(): Promise<void> {
   });
   const starboardWorker = startStarboardWorker(pool, guildId, starboardRuntimeDependencies(client, guildId, token),
     () => !stopping && client.isReady());
-  const autoModWorker = startAutoModWorker(pool, guildId, autoModDependencies(client, guildId, token),
+  const autoModWorker = startAutoModWorker(pool, guildId, { ...autoModDependencies(client, guildId, token), checkScamDomains: async (domains) => scamFeed.check(domains) },
     () => !stopping && client.isReady());
   const honeypotWorker = startHoneypotWorker(pool, guildId, honeypotDependencies(client, guildId, token, warningDeps),
     () => !stopping && client.isReady());
+  const scamFeedWorker = startScamFeedWorker(pool, guildId, scamFeed, () => !stopping && client.isReady());
   const raidWorker = startRaidWorker(pool, guildId, raidDeps, warningDeps, () => !stopping && client.isReady());
   const communityWorker = startCommunityWorker(pool, guildId, communityDependencies(client, guildId, token), {
     isReady: () => communityEvents && communityConnected && !stopping && client.isReady(),
@@ -139,7 +143,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([

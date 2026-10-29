@@ -72,3 +72,7 @@ The Community roles page configures Nomad, permanent Community, message/voice ac
 ## Manual raid response
 
 The Raid response page configures designated ordinary invites and builds a fixed join-window preview. Staff review exclusions and the exact selected action list before count-based confirmation. The tool defaults Off. See [raid-response.md](raid-response.md) for permissions, partial-result recovery, Community preservation limits and deferred live checks.
+
+## Link protection
+
+Link protection has separate saves for repeated URLs and known scam-domain matching, with shared AutoMod exemptions and per-rule overrides. Both default Off. See [link-protection.md](link-protection.md) for normalization, configurable 12-hour link punishment, unverified review logging, provider limits and deferred live checks.
