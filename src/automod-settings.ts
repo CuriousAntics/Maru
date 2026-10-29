@@ -1,3 +1,5 @@
+import { readLinkSettings } from './link-settings.js';
+import type { LinkSettings } from './link-settings.js';
 import type { Pool } from 'pg';
 import { logChannelId } from './server-settings.js';
 import { digest } from './web-security.js';
@@ -7,7 +9,7 @@ export type AutoModResources = {
   roles: { id: string; name: string }[]; channels: { id: string; name: string }[];
   canDelete: boolean; canTimeout: boolean;
 };
-export type AutoModSettings = {
+export type AutoModSettings = Partial<LinkSettings> & {
   invite_enabled?: boolean; invite_timeout_seconds?: number; invite_allowed_guild_ids?: string[]; invite_enforced_role_ids?: string[]; invite_enforced_channel_ids?: string[];
   repeat_enabled?: boolean; repeat_text?: boolean; repeat_images?: boolean; repeat_limit?: number; repeat_window_seconds?: number; repeat_timeout_seconds?: number; repeat_enforced_role_ids?: string[]; repeat_enforced_channel_ids?: string[];
   spam_enabled?: boolean; spam_limit?: number; spam_window_seconds?: number; spam_timeout_seconds?: number; spam_enforced_role_ids?: string[]; spam_enforced_channel_ids?: string[];
@@ -17,18 +19,19 @@ export type AutoModSettings = {
 export class AutoModError extends Error { constructor(public readonly code: string) { super(code); } }
 export const autoModLock = 731209;
 export async function readAutoModSettings(pool: Pick<Pool,'query'>,guildId: string,resources?: AutoModResources): Promise<AutoModSettings> {
+  const links=await readLinkSettings(pool,guildId);
   const row = (await pool.query<AutoModSettings>('SELECT * FROM automod_settings WHERE guild_id=$1',[guildId])).rows[0];
-  if (row) return { invite_enabled: false,invite_timeout_seconds: 600,invite_allowed_guild_ids: [],invite_enforced_role_ids: [],invite_enforced_channel_ids: [],repeat_enabled: false,repeat_text: true,repeat_images: true,repeat_limit: 3,repeat_window_seconds: 30,repeat_timeout_seconds: 600,repeat_enforced_role_ids: [],repeat_enforced_channel_ids: [],spam_enabled: false,spam_limit: 5,spam_window_seconds: 5,spam_timeout_seconds: 600,spam_enforced_role_ids: [],spam_enforced_channel_ids: [],...row };
+  if (row) return { ...links,invite_enabled: false,invite_timeout_seconds: 600,invite_allowed_guild_ids: [],invite_enforced_role_ids: [],invite_enforced_channel_ids: [],repeat_enabled: false,repeat_text: true,repeat_images: true,repeat_limit: 3,repeat_window_seconds: 30,repeat_timeout_seconds: 600,repeat_enforced_role_ids: [],repeat_enforced_channel_ids: [],spam_enabled: false,spam_limit: 5,spam_window_seconds: 5,spam_timeout_seconds: 600,spam_enforced_role_ids: [],spam_enforced_channel_ids: [],...row };
   const mapped = (await pool.query<{ role_id: string }>('SELECT role_id FROM staff_roles WHERE guild_id=$1',[guildId])).rows.map((role) => role.role_id);
-  return { invite_enabled: false,invite_timeout_seconds: 600,invite_allowed_guild_ids: [],invite_enforced_role_ids: [],invite_enforced_channel_ids: [],repeat_enabled: false,repeat_text: true,repeat_images: true,repeat_limit: 3,repeat_window_seconds: 30,repeat_timeout_seconds: 600,repeat_enforced_role_ids: [],repeat_enforced_channel_ids: [],spam_enabled: false,spam_limit: 5,spam_window_seconds: 5,spam_timeout_seconds: 600,spam_enforced_role_ids: [],spam_enforced_channel_ids: [],guild_id: guildId,blocked_enabled: false,blocked_words: [],timeout_seconds: 600,exempt_role_ids: [...new Set([...mapped,
+  return { ...links,invite_enabled: false,invite_timeout_seconds: 600,invite_allowed_guild_ids: [],invite_enforced_role_ids: [],invite_enforced_channel_ids: [],repeat_enabled: false,repeat_text: true,repeat_images: true,repeat_limit: 3,repeat_window_seconds: 30,repeat_timeout_seconds: 600,repeat_enforced_role_ids: [],repeat_enforced_channel_ids: [],spam_enabled: false,spam_limit: 5,spam_window_seconds: 5,spam_timeout_seconds: 600,spam_enforced_role_ids: [],spam_enforced_channel_ids: [],guild_id: guildId,blocked_enabled: false,blocked_words: [],timeout_seconds: 600,exempt_role_ids: [...new Set([...mapped,
     ...(resources?.roles.filter((role) => ['owner','community manager'].includes(role.name.toLowerCase())).map((role) => role.id) ?? [])])].sort(),
     ignored_channel_ids: [],enforced_role_ids: [],enforced_channel_ids: [],revision: 0 };
 }
-export function autoModExempt(settings: AutoModSettings,roles: string[],channelId: string,parentId: string | null,rule: 'blocked_words'|'rapid_messages'|'repeated_messages'|'discord_invites'='blocked_words'): boolean {
+export function autoModExempt(settings: AutoModSettings,roles: string[],channelId: string,parentId: string | null,rule: 'blocked_words'|'rapid_messages'|'repeated_messages'|'discord_invites'|'link_cooldown'|'scam_links'='blocked_words'): boolean {
   const roleMatch = (ids: string[]) => ids.some((id) => roles.includes(id));
   const channelMatch = (ids: string[]) => ids.includes(channelId) || !!parentId && ids.includes(parentId);
-  return (roleMatch(settings.exempt_role_ids) && !roleMatch(rule==='discord_invites'?settings.invite_enforced_role_ids ?? []:rule==='repeated_messages'?settings.repeat_enforced_role_ids ?? []:rule==='rapid_messages'?settings.spam_enforced_role_ids ?? []:settings.enforced_role_ids)) ||
-    (channelMatch(settings.ignored_channel_ids) && !channelMatch(rule==='discord_invites'?settings.invite_enforced_channel_ids ?? []:rule==='repeated_messages'?settings.repeat_enforced_channel_ids ?? []:rule==='rapid_messages'?settings.spam_enforced_channel_ids ?? []:settings.enforced_channel_ids));
+  return (roleMatch(settings.exempt_role_ids) && !roleMatch(rule==='link_cooldown'?settings.link_enforced_role_ids ?? []:rule==='scam_links'?settings.scam_enforced_role_ids ?? []:rule==='discord_invites'?settings.invite_enforced_role_ids ?? []:rule==='repeated_messages'?settings.repeat_enforced_role_ids ?? []:rule==='rapid_messages'?settings.spam_enforced_role_ids ?? []:settings.enforced_role_ids)) ||
+    (channelMatch(settings.ignored_channel_ids) && !channelMatch(rule==='link_cooldown'?settings.link_enforced_channel_ids ?? []:rule==='scam_links'?settings.scam_enforced_channel_ids ?? []:rule==='discord_invites'?settings.invite_enforced_channel_ids ?? []:rule==='repeated_messages'?settings.repeat_enforced_channel_ids ?? []:rule==='rapid_messages'?settings.spam_enforced_channel_ids ?? []:settings.enforced_channel_ids));
 }
 export async function saveAutoModSettings(pool: Pick<Pool,'connect'>,input: {
   inviteEnabled?: boolean; inviteTimeoutSeconds?: number; inviteAllowedGuilds?: string[]; inviteEnforcedRoles?: string[]; inviteEnforcedChannels?: string[];
@@ -95,6 +98,11 @@ export async function saveAutoModSettings(pool: Pick<Pool,'connect'>,input: {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) ON CONFLICT (guild_id) DO UPDATE SET blocked_enabled=$2,blocked_words=$3,timeout_seconds=$4,
       exempt_role_ids=$5,ignored_channel_ids=$6,enforced_role_ids=$7,enforced_channel_ids=$8,revision=$9,updated_by=$10,updated_at=NOW(),spam_enabled=$11,spam_limit=$12,spam_window_seconds=$13,spam_timeout_seconds=$14,spam_enforced_role_ids=$15,spam_enforced_channel_ids=$16,repeat_enabled=$17,repeat_text=$18,repeat_images=$19,repeat_limit=$20,repeat_window_seconds=$21,repeat_timeout_seconds=$22,repeat_enforced_role_ids=$23,repeat_enforced_channel_ids=$24,invite_enabled=$25,invite_timeout_seconds=$26,invite_allowed_guild_ids=$27,invite_enforced_role_ids=$28,invite_enforced_channel_ids=$29`,
       [input.guildId,after.blocked_enabled,after.blocked_words,after.timeout_seconds,after.exempt_role_ids,after.ignored_channel_ids,after.enforced_role_ids,after.enforced_channel_ids,after.revision,input.actorId,after.spam_enabled,after.spam_limit,after.spam_window_seconds,after.spam_timeout_seconds,after.spam_enforced_role_ids,after.spam_enforced_channel_ids,after.repeat_enabled,after.repeat_text,after.repeat_images,after.repeat_limit,after.repeat_window_seconds,after.repeat_timeout_seconds,after.repeat_enforced_role_ids,after.repeat_enforced_channel_ids,after.invite_enabled,after.invite_timeout_seconds,after.invite_allowed_guild_ids,after.invite_enforced_role_ids,after.invite_enforced_channel_ids]);
+    await client.query(`UPDATE automod_link_settings SET
+      link_enforced_role_ids=ARRAY(SELECT id FROM unnest(link_enforced_role_ids) id WHERE id=ANY($2::text[])),
+      scam_enforced_role_ids=ARRAY(SELECT id FROM unnest(scam_enforced_role_ids) id WHERE id=ANY($2::text[])),
+      link_enforced_channel_ids=ARRAY(SELECT id FROM unnest(link_enforced_channel_ids) id WHERE id=ANY($3::text[])),
+      scam_enforced_channel_ids=ARRAY(SELECT id FROM unnest(scam_enforced_channel_ids) id WHERE id=ANY($3::text[])) WHERE guild_id=$1`,[input.guildId,after.exempt_role_ids,after.ignored_channel_ids]);
     await client.query("INSERT INTO audit_events (guild_id,actor_id,event_type,details) VALUES ($1,$2,'AUTOMOD_SETTINGS_CHANGED',$3::jsonb)",[input.guildId,input.actorId,JSON.stringify({ before,after,reason })]);
     await client.query('COMMIT'); transaction=false;
   } catch(error) { if(transaction) { try { await client.query('ROLLBACK'); } catch { discard=true; } } throw error; }

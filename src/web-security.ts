@@ -87,3 +87,7 @@ export function communityProof(token: string,revision: number,action: string): s
 export function raidProof(token: string,action: string,scope: string): string {
  return createHmac('sha256',token).update(`maru-raid:${action}:${scope}`).digest('base64url');
 }
+
+export function linkSettingsProof(token: string,section: string,revision: number,sharedRevision: number): string {
+ return createHmac('sha256',token).update(`maru-links:${section}:${revision}:${sharedRevision}`).digest('base64url');
+}

@@ -85,7 +85,7 @@ async function request(path: string,init: RequestInit={}) { return fetch(base+pa
 function form(overrides: Record<string,string>={}) { return new URLSearchParams({ csrf: autoModProof(token,0),revision: '0',enabled: 'true',words: 'marutestword',timeout: '10m',reason: 'Enable test rule',exempt_role: admin,...overrides }); }
 async function post(body: URLSearchParams | string=form(),headers: Record<string,string>={}) { return request('/automod',{ method: 'POST',body,headers: { origin: base,'content-type': 'application/x-www-form-urlencoded',...headers } }); }
 before(async () => {
-  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql','011_rapid_messages.sql','012_repeated_messages.sql','013_discord_invites.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+  for(const name of ['001_foundation.sql','002_dashboard_auth.sql','003_moderation_warnings.sql','004_case_changes.sql','005_timeouts.sql','006_bans.sql','010_blocked_words.sql','011_rapid_messages.sql','012_repeated_messages.sql','013_discord_invites.sql','017_link_protection.sql']) await db.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
   await new Promise<void>((resolve) => server.listen(0,'127.0.0.1',resolve)); base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 beforeEach(async () => {
@@ -96,7 +96,7 @@ beforeEach(async () => {
     channels: [{ id: channel,name: 'general' },{ id: logs,name: 'logs' },{ id: otherChannel,name: 'finished-work' }],canDelete: true,canTimeout: true };
   context={ guildName: 'Maru Development',roleIds: [],parentId: null,owner: false,canDelete: true,canTimeout: true,timeoutUntil: null };
   await db.exec('SELECT pg_advisory_unlock_all()');
-  await db.exec('TRUNCATE automod_invite_reviews,automod_repeat_activity,automod_message_activity,automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
+  await db.exec('TRUNCATE automod_link_activity,automod_link_reviews,automod_link_settings,automod_invite_reviews,automod_repeat_activity,automod_message_activity,automod_counters,automod_violations,automod_jobs,automod_settings,moderation_cases,guild_case_counters,dashboard_sessions,dashboard_login_attempts,audit_events,staff_access_grants,staff_roles,guild_settings RESTART IDENTITY');
   await query('INSERT INTO guild_settings (guild_id,settings) VALUES ($1,$3::jsonb),($2,$3::jsonb)',[guild,otherGuild,JSON.stringify({ moderation_log_channel_id: logs })]);
   await query("INSERT INTO staff_roles (guild_id,role_id,access_level) VALUES ($1,$2,'admin'),($1,$3,'moderator')",[guild,admin,mod]);
   await query("INSERT INTO dashboard_sessions (token_hash,guild_id,user_id,display_name,expires_at) VALUES ($1,$2,$3,'Staff',NOW()+INTERVAL '1 hour')",[digest(token),guild,actor]);
