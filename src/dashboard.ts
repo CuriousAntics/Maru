@@ -1,3 +1,5 @@
+import { handleRaidPage } from './raid-web.js';
+import type { RaidDependencies } from './raid-settings.js';
 import { handleCommunityPage } from './community-web.js';
 import type { CommunityResources } from './community-settings.js';
 import { handleHoneypotPage } from './honeypot-web.js';
@@ -30,6 +32,7 @@ type Options = {
   isBotReady: () => boolean;
   readMemberRoles: (userId: string) => Promise<string[] | null>;
   readLogChannels?: () => Promise<LogChannel[]>;
+  raidDependencies?: RaidDependencies;
   readCommunityResources?: () => Promise<CommunityResources>;
   readHoneypotResources?: () => Promise<HoneypotResources>;
   readAutoModResources?: () => Promise<AutoModResources>;
@@ -82,11 +85,12 @@ export function createDashboardHandler(options: Options) {
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
     const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community'];
+    const raidPath = /^\/raids(?:\/[^/]+)?$/.test(path);
     const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save|delete|delete-confirm))?)?$/.test(path);
     const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save|delete)$/.test(path);
     const caseDetail = /^\/cases\/([^/]+)$/.exec(path);
     const caseMutation = /^\/cases\/([^/]+)\/(correct|void)$/.exec(path);
-    if (!routes.includes(path) && !caseDetail && !caseMutation && !starboardPath) {
+    if (!routes.includes(path) && !caseDetail && !caseMutation && !starboardPath && !raidPath) {
       message(response, 404, 'Page not found', 'This page is not available.');
       return;
     }
@@ -94,7 +98,7 @@ export function createDashboardHandler(options: Options) {
       message(response, 503, 'Dashboard setup pending', 'Dashboard sign-in has not been configured yet.');
       return;
     }
-    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : ['/settings','/automod','/honeypot','/community'].includes(path) ? 'GET, POST' : 'GET';
+    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : (raidPath || ['/settings','/automod','/honeypot','/community'].includes(path)) ? 'GET, POST' : 'GET';
     if (!expectedMethod.split(', ').includes(request.method ?? '')) {
       response.setHeader('Allow', expectedMethod);
       message(response, 405, 'Method not allowed', 'Use the dashboard controls to continue.');
@@ -268,6 +272,12 @@ export function createDashboardHandler(options: Options) {
       response.setHeader('Set-Cookie', cookie(sessionName, '', 0, config.secure));
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
       return;
+    }
+    if (raidPath) {
+      if (!options.raidDependencies) throw new Error('RAID_RESOURCES_UNAVAILABLE');
+      await handleRaidPage(request,path,{ pool,guildId,actorId: session.user_id,token: sessionToken,origin: config.origin,access,deps: options.raidDependencies },{
+        html: (status,render) => html(response,status,render),redirect: (location) => redirect(response,location),
+      }); return;
     }
     if (path === '/community') {
       if (!options.readCommunityResources) throw new Error('COMMUNITY_RESOURCES_UNAVAILABLE');

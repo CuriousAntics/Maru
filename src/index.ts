@@ -1,3 +1,5 @@
+import { raidDependencies } from './raid-discord.js';
+import { startRaidWorker } from './raid-worker.js';
 import { startCommunityWorker } from './community-worker.js';
 import { communityDependencies, communityResources, communityVoiceSnapshot } from './community-discord.js';
 import { startHoneypotWorker } from './honeypot-worker.js';
@@ -59,6 +61,7 @@ async function main(): Promise<void> {
   const warningDeps = warningDependencies(client, guildId, readLogChannels);
   const timeoutDeps = timeoutDependencies(client, guildId, token, warningDeps);
   const banDeps = banDependencies(client, guildId, token, warningDeps);
+  const raidDeps = raidDependencies(client, guildId, token, communityEvents);
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
     isBotReady: () => !stopping && client.isReady(),
@@ -69,6 +72,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    raidDependencies: raidDeps,
     readCommunityResources: communityResources(client, guildId, communityEvents),
     readHoneypotResources: honeypotResources(client, guildId),
     readAutoModResources: autoModResources(client, guildId),
@@ -89,6 +93,7 @@ async function main(): Promise<void> {
     () => !stopping && client.isReady());
   const honeypotWorker = startHoneypotWorker(pool, guildId, honeypotDependencies(client, guildId, token, warningDeps),
     () => !stopping && client.isReady());
+  const raidWorker = startRaidWorker(pool, guildId, raidDeps, warningDeps, () => !stopping && client.isReady());
   const communityWorker = startCommunityWorker(pool, guildId, communityDependencies(client, guildId, token), {
     isReady: () => communityEvents && communityConnected && !stopping && client.isReady(),
     snapshot: () => communityVoiceSnapshot(client, guildId),
@@ -134,7 +139,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
