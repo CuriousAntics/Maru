@@ -68,3 +68,7 @@ The Honeypot navigation item opens trap-channel settings and recent event result
 ## Community roles
 
 The Community roles page configures Nomad, permanent Community, message/voice activity and preservation of current role holders. Tracking, automatic role changes and privileged event intake default Off. See [community-roles.md](community-roles.md) for setup, persistence, deferred validation and the still-pending StatBot progress migration.
+
+## Manual raid response
+
+The Raid response page configures designated ordinary invites and builds a fixed join-window preview. Staff review exclusions and the exact selected action list before count-based confirmation. The tool defaults Off. See [raid-response.md](raid-response.md) for permissions, partial-result recovery, Community preservation limits and deferred live checks.

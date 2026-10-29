@@ -11,7 +11,7 @@ export class WarningError extends Error {
 }
 export type DeliveryStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'unconfirmed' | 'not_configured' | 'skipped';
 export type WarningCase = {
-  origin?: 'manual' | 'automod';
+  origin?: 'manual' | 'automod' | 'raid';
   guild_id: string; case_number: number; request_id: string; action: 'warning' | 'timeout' | 'untimeout' | 'ban' | 'unban' | 'softban';
   actor_id: string; target_user_id: string; reason: string; guild_name: string;
   log_channel_id: string | null; dm_status: DeliveryStatus; log_status: DeliveryStatus;

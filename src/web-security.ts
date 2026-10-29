@@ -83,3 +83,7 @@ export function honeypotProof(token: string,revision: number): string {
 export function communityProof(token: string,revision: number,action: string): string {
   return createHmac('sha256',token).update(`maru-community:${revision}:${action}`).digest('base64url');
 }
+
+export function raidProof(token: string,action: string,scope: string): string {
+ return createHmac('sha256',token).update(`maru-raid:${action}:${scope}`).digest('base64url');
+}
