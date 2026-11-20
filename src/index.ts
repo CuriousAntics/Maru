@@ -1,3 +1,7 @@
+import { builtInCommandNames } from './commands.js';
+import { customCommandSync } from './custom-command-discord.js';
+import { startCustomCommandWorker } from './custom-command-sync.js';
+import { handleCustomCommand } from './handle-custom-command.js';
 import { chatClearDependencies, chatClearResources } from './chat-clear-discord.js';
 import { startChatClearWorker } from './chat-clear-engine.js';
 import { createScamFeed, startScamFeedWorker } from './scam-feed.js';
@@ -99,6 +103,7 @@ async function main(): Promise<void> {
     () => !stopping && client.isReady());
   const honeypotWorker = startHoneypotWorker(pool, guildId, honeypotDependencies(client, guildId, token, warningDeps),
     () => !stopping && client.isReady());
+  const customCommandWorker = startCustomCommandWorker(pool, guildId, customCommandSync(client, guildId, token), () => !stopping && client.isReady());
   const chatClearWorker = startChatClearWorker(pool, guildId, chatClearDependencies(client, guildId, token), () => !stopping && client.isReady());
   const scamFeedWorker = startScamFeedWorker(pool, guildId, scamFeed, () => !stopping && client.isReady());
   const raidWorker = startRaidWorker(pool, guildId, raidDeps, warningDeps, () => !stopping && client.isReady());
@@ -147,7 +152,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
@@ -162,7 +167,11 @@ async function main(): Promise<void> {
   client.once(Events.ClientReady, () => { communityConnected = true; communityWorker.resetVoice(); console.log('Maru is connected to Discord.'); });
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-    if (!['ping', 'staff-check', 'staff-access', 'warn', 'case', 'timeout', 'untimeout', 'ban', 'unban'].includes(interaction.commandName)) return;
+    if (!builtInCommandNames.has(interaction.commandName)) {
+      try { await handleCustomCommand(interaction, pool, guildId); }
+      catch { console.error('Custom command acknowledgement could not be completed.'); }
+      return;
+    }
     try {
       if (interaction.guildId !== guildId || !interaction.member) {
         await interaction.reply({

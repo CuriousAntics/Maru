@@ -66,3 +66,6 @@ export const unban = new SlashCommandBuilder().setName('unban')
     .setMinLength(17).setMaxLength(20).setRequired(true))
   .addStringOption((option) => option.setName('reason').setDescription('Why the ban should be removed')
     .setMinLength(1).setMaxLength(500).setRequired(true));
+
+export const builtInCommands = [ping, staffCheck, staffAccess, warn, caseLookup, timeout, untimeout, ban, unban];
+export const builtInCommandNames = new Set(builtInCommands.map(command => command.name));

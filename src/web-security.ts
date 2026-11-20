@@ -95,3 +95,7 @@ export function linkSettingsProof(token: string,section: string,revision: number
 export function chatClearProof(token: string, revision: number): string {
   return createHmac('sha256', token).update(`maru-chat-clear:${revision}`).digest('base64url');
 }
+
+export function customCommandProof(token: string, name: string, revision: number): string {
+  return createHmac('sha256',token).update(`maru-custom-command:${name}:${revision}`).digest('base64url');
+}
