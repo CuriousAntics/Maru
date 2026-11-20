@@ -34,7 +34,7 @@ async function enable() {await saveCustomCommand(pool,input({enabled:true}));awa
 let handler: ReturnType<typeof createDashboardHandler>,base: string;
 const server=createServer((req,res)=>{void handler(req,res);});
 async function request(init: RequestInit={},path='/custom-commands') {return fetch(base+path,{...init,redirect:'manual',headers:{cookie:`maru_session=${token}`,connection:'close',...init.headers}});}
-const form=()=>new URLSearchParams({csrf:customCommandProof(token,'$new',0),scope:'$new',revision:'0',name:'magic',description:'Magic',response:'https://example.com/magic.gif',enabled:'false',reason:'Add command',action:'save'});
+const form=()=>new URLSearchParams({csrf:customCommandProof(token,'$new',0),scope:'$new',revision:'0',name:'magic',description:'Magic',response:'https://example.com/magic.gif',enabled:'false',inline:'false',reason:'Add command',action:'save'});
 before(async()=>{
   for(const name of (await readdir(new URL('../migrations/',import.meta.url))).filter(n=>n.endsWith('.sql')).sort())await db.exec(await readFile(new URL('../migrations/'+name,import.meta.url),'utf8'));
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;

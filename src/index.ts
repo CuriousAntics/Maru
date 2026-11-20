@@ -1,3 +1,5 @@
+import { inlineCommandDependencies } from './inline-command-discord.js';
+import { startInlineCommandWorker } from './inline-commands.js';
 import { builtInCommandNames } from './commands.js';
 import { customCommandSync } from './custom-command-discord.js';
 import { startCustomCommandWorker } from './custom-command-sync.js';
@@ -103,6 +105,7 @@ async function main(): Promise<void> {
     () => !stopping && client.isReady());
   const honeypotWorker = startHoneypotWorker(pool, guildId, honeypotDependencies(client, guildId, token, warningDeps),
     () => !stopping && client.isReady());
+  const inlineCommandWorker = startInlineCommandWorker(pool, guildId, inlineCommandDependencies(client, guildId, token), () => !stopping && client.isReady());
   const customCommandWorker = startCustomCommandWorker(pool, guildId, customCommandSync(client, guildId, token), () => !stopping && client.isReady());
   const chatClearWorker = startChatClearWorker(pool, guildId, chatClearDependencies(client, guildId, token), () => !stopping && client.isReady());
   const scamFeedWorker = startScamFeedWorker(pool, guildId, scamFeed, () => !stopping && client.isReady());
@@ -125,6 +128,7 @@ async function main(): Promise<void> {
   client.on(Events.GuildAvailable, (guild) => { if (guild.id === guildId) { communityConnected = true; communityWorker.resetVoice(); } });
   client.on(Events.Raw, (packet) => {
     if (stopping) return;
+    inlineCommandWorker.accept(packet);
     communityWorker.accept(packet);
     honeypotWorker.accept(packet);
     autoModWorker.accept(packet);
@@ -152,7 +156,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop(), inlineCommandWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([

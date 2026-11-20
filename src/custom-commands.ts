@@ -3,7 +3,7 @@ import { builtInCommandNames } from './commands.js';
 import { digest } from './web-security.js';
 import { getStaffAccess } from './staff-access.js';
 export type CustomCommand = {
-  guild_id: string; name: string; description: string; response: string; enabled: boolean; deleted: boolean;
+  guild_id: string; name: string; description: string; response: string; enabled: boolean; deleted: boolean; inline_enabled: boolean;
   revision: number; discord_id: string | null; sync_status: 'pending'|'running'|'synced'|'error'; sync_note: string;
   sync_started_at: Date | string | null;
 };
@@ -13,12 +13,12 @@ export class CustomCommandError extends Error {
 }
 export async function saveCustomCommand(pool: Pick<Pool,'connect'>, i: {
   guildId: string; actorId: string; token: string; name: string; revision: number; description: string; response: string;
-  enabled: boolean; remove: boolean; reason: string; readRoles: (id: string) => Promise<string[] | null>;
+  enabled: boolean; inlineEnabled?: boolean; remove: boolean; reason: string; readRoles: (id: string) => Promise<string[] | null>;
 }) {
   const description = i.description.trim(), response = i.response.trim(), reason = i.reason.trim();
   if (!customName(i.name) || !Number.isInteger(i.revision) || i.revision < 0 || i.revision >= 2147483647 ||
       !description || description.length > 100 || !response || response.length > 2000 || !reason || reason.length > 500 ||
-      typeof i.enabled !== 'boolean' || typeof i.remove !== 'boolean') throw new CustomCommandError('INVALID_INPUT');
+      typeof i.enabled !== 'boolean' || i.inlineEnabled !== undefined && typeof i.inlineEnabled !== 'boolean' || typeof i.remove !== 'boolean') throw new CustomCommandError('INVALID_INPUT');
   const db = await pool.connect(); let discard = false;
   try {
     await db.query('BEGIN'); await db.query("SET LOCAL lock_timeout='5s'");
@@ -35,14 +35,15 @@ export async function saveCustomCommand(pool: Pick<Pool,'connect'>, i: {
     if ((!before || before.deleted) && !i.remove && Number((await db.query<{ count: string }>(
       'SELECT count(*) FROM custom_commands WHERE guild_id=$1 AND NOT deleted',[i.guildId])).rows[0]!.count) >= 80) throw new CustomCommandError('LIMIT');
     const enabled = !i.remove && i.enabled;
-    await db.query(`INSERT INTO custom_commands (guild_id,name,description,response,enabled,deleted,revision,updated_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (guild_id,name) DO UPDATE SET
+    const inlineEnabled = i.inlineEnabled ?? before?.inline_enabled ?? false;
+    await db.query(`INSERT INTO custom_commands (guild_id,name,description,response,enabled,deleted,revision,updated_by,inline_enabled)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (guild_id,name) DO UPDATE SET
       description=$3,response=$4,enabled=$5,deleted=$6,revision=$7,updated_by=$8,updated_at=NOW(),
-      sync_status='pending',sync_note='Waiting to synchronize',sync_started_at=NULL`,
-      [i.guildId,i.name,description,response,enabled,i.remove,i.revision+1,i.actorId]);
+      inline_enabled=$9,sync_status='pending',sync_note='Waiting to synchronize',sync_started_at=NULL`,
+      [i.guildId,i.name,description,response,enabled,i.remove,i.revision+1,i.actorId,inlineEnabled]);
     // Response content belongs in settings, not duplicated into audit or moderation logs.
     await db.query("INSERT INTO audit_events(guild_id,actor_id,event_type,details) VALUES ($1,$2,'CUSTOM_COMMAND_CHANGED',$3::jsonb)",
-      [i.guildId,i.actorId,JSON.stringify({ name:i.name,revision:i.revision+1,enabled,removed:i.remove,reason })]);
+      [i.guildId,i.actorId,JSON.stringify({ name:i.name,revision:i.revision+1,enabled,inline_enabled:inlineEnabled,removed:i.remove,reason })]);
     await db.query('COMMIT');
   } catch (error) {
     try { await db.query('ROLLBACK'); } catch { discard = true; }
