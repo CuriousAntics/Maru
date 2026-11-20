@@ -1,3 +1,5 @@
+import { chatClearDependencies, chatClearResources } from './chat-clear-discord.js';
+import { startChatClearWorker } from './chat-clear-engine.js';
 import { createScamFeed, startScamFeedWorker } from './scam-feed.js';
 import { raidDependencies } from './raid-discord.js';
 import { startRaidWorker } from './raid-worker.js';
@@ -74,6 +76,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    readChatClearResources: chatClearResources(client, guildId),
     raidDependencies: raidDeps,
     scamFeedStatus: scamFeed.status,
     readCommunityResources: communityResources(client, guildId, communityEvents),
@@ -96,6 +99,7 @@ async function main(): Promise<void> {
     () => !stopping && client.isReady());
   const honeypotWorker = startHoneypotWorker(pool, guildId, honeypotDependencies(client, guildId, token, warningDeps),
     () => !stopping && client.isReady());
+  const chatClearWorker = startChatClearWorker(pool, guildId, chatClearDependencies(client, guildId, token), () => !stopping && client.isReady());
   const scamFeedWorker = startScamFeedWorker(pool, guildId, scamFeed, () => !stopping && client.isReady());
   const raidWorker = startRaidWorker(pool, guildId, raidDeps, warningDeps, () => !stopping && client.isReady());
   const communityWorker = startCommunityWorker(pool, guildId, communityDependencies(client, guildId, token), {
@@ -143,7 +147,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
