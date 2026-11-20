@@ -1,3 +1,4 @@
+import { handleFormsPage } from './forms-web.js';
 import { handleCustomCommandPage } from './custom-command-web.js';
 import { handleChatClearPage } from './chat-clear-web.js';
 import type { ChatClearResources } from './chat-clear-settings.js';
@@ -91,13 +92,14 @@ export function createDashboardHandler(options: Options) {
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
-    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community', '/links', '/chat-clear', '/custom-commands'];
+    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community', '/links', '/chat-clear', '/custom-commands', '/forms'];
+    const formsPath = /^\/forms(?:\/(?:responses|files)\/[0-9a-f-]{36})?$/.test(path);
     const raidPath = /^\/raids(?:\/[^/]+)?$/.test(path);
     const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save|delete|delete-confirm))?)?$/.test(path);
     const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save|delete)$/.test(path);
     const caseDetail = /^\/cases\/([^/]+)$/.exec(path);
     const caseMutation = /^\/cases\/([^/]+)\/(correct|void)$/.exec(path);
-    if (!routes.includes(path) && !caseDetail && !caseMutation && !starboardPath && !raidPath) {
+    if (!routes.includes(path) && !caseDetail && !caseMutation && !starboardPath && !raidPath && !formsPath) {
       message(response, 404, 'Page not found', 'This page is not available.');
       return;
     }
@@ -105,7 +107,7 @@ export function createDashboardHandler(options: Options) {
       message(response, 503, 'Dashboard setup pending', 'Dashboard sign-in has not been configured yet.');
       return;
     }
-    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : (raidPath || ['/settings','/automod','/honeypot','/community','/links','/chat-clear','/custom-commands'].includes(path)) ? 'GET, POST' : 'GET';
+    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : (formsPath && !path.startsWith('/forms/files/') || raidPath || ['/settings','/automod','/honeypot','/community','/links','/chat-clear','/custom-commands'].includes(path)) ? 'GET, POST' : 'GET';
     if (!expectedMethod.split(', ').includes(request.method ?? '')) {
       response.setHeader('Allow', expectedMethod);
       message(response, 405, 'Method not allowed', 'Use the dashboard controls to continue.');
@@ -278,6 +280,19 @@ export function createDashboardHandler(options: Options) {
       await pool.query('DELETE FROM dashboard_sessions WHERE token_hash = $1', [digest(sessionToken)]);
       response.setHeader('Set-Cookie', cookie(sessionName, '', 0, config.secure));
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
+      return;
+    }
+    if (formsPath) {
+      await handleFormsPage(request, { pool, guildId, actorId: session.user_id, token: sessionToken, origin: config.origin, access,
+        readRoles: readMemberRoles, readChannels: options.readLogChannels }, {
+        html: (status, render) => html(response, status, render), redirect: location => redirect(response, location),
+        download: (filename, data) => {
+          headers(response, randomToken());
+          response.setHeader('Content-Disposition', `attachment; filename="download"; filename*=UTF-8''${encodeURIComponent(filename).replace(/['()*]/g, c => '%'+c.charCodeAt(0).toString(16))}`);
+          response.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': data.length });
+          response.end(data);
+        },
+      });
       return;
     }
     if (path === '/custom-commands') {
