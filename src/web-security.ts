@@ -99,3 +99,7 @@ export function chatClearProof(token: string, revision: number): string {
 export function customCommandProof(token: string, name: string, revision: number): string {
   return createHmac('sha256',token).update(`maru-custom-command:${name}:${revision}`).digest('base64url');
 }
+
+export function formProof(token: string, scope: string): string {
+  return createHmac('sha256',token).update(`maru-forms:${scope}`).digest('base64url');
+}

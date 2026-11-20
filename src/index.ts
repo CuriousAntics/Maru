@@ -1,3 +1,5 @@
+import { handleFormInteraction, formsDelivery } from './forms-discord.js';
+import { startFormsWorker } from './forms-worker.js';
 import { inlineCommandDependencies } from './inline-command-discord.js';
 import { startInlineCommandWorker } from './inline-commands.js';
 import { builtInCommandNames } from './commands.js';
@@ -99,6 +101,7 @@ async function main(): Promise<void> {
       }
     },
   });
+  const formsWorker = startFormsWorker(pool, guildId, formsDelivery(token, readLogChannels, warningDeps.readActorRoles), () => !stopping && client.isReady());
   const starboardWorker = startStarboardWorker(pool, guildId, starboardRuntimeDependencies(client, guildId, token),
     () => !stopping && client.isReady());
   const autoModWorker = startAutoModWorker(pool, guildId, { ...autoModDependencies(client, guildId, token), checkScamDomains: async (domains) => scamFeed.check(domains) },
@@ -156,7 +159,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop(), inlineCommandWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop(), inlineCommandWorker.stop(), formsWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
@@ -170,6 +173,9 @@ async function main(): Promise<void> {
   client.on(Events.Error, () => console.error('Discord client error. Check connection status.'));
   client.once(Events.ClientReady, () => { communityConnected = true; communityWorker.resetVoice(); console.log('Maru is connected to Discord.'); });
   client.on(Events.InteractionCreate, async (interaction) => {
+    if (stopping) return;
+    try { if (await handleFormInteraction(interaction, pool, guildId)) return; }
+    catch { console.error('Form interaction could not be acknowledged.'); return; }
     if (!interaction.isChatInputCommand()) return;
     if (!builtInCommandNames.has(interaction.commandName)) {
       try { await handleCustomCommand(interaction, pool, guildId); }
