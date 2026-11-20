@@ -1,3 +1,5 @@
+import { handleChatClearPage } from './chat-clear-web.js';
+import type { ChatClearResources } from './chat-clear-settings.js';
 import { handleLinkPage } from './link-web.js';
 import type { ScamFeedStatus } from './scam-feed.js';
 import { handleRaidPage } from './raid-web.js';
@@ -37,6 +39,7 @@ type Options = {
   scamFeedStatus?: () => ScamFeedStatus;
   raidDependencies?: RaidDependencies;
   readCommunityResources?: () => Promise<CommunityResources>;
+  readChatClearResources?: () => Promise<ChatClearResources>;
   readHoneypotResources?: () => Promise<HoneypotResources>;
   readAutoModResources?: () => Promise<AutoModResources>;
   sendTestMessage?: SendTestMessage;
@@ -87,7 +90,7 @@ export function createDashboardHandler(options: Options) {
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
-    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community', '/links'];
+    const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community', '/links', '/chat-clear'];
     const raidPath = /^\/raids(?:\/[^/]+)?$/.test(path);
     const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save|delete|delete-confirm))?)?$/.test(path);
     const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save|delete)$/.test(path);
@@ -101,7 +104,7 @@ export function createDashboardHandler(options: Options) {
       message(response, 503, 'Dashboard setup pending', 'Dashboard sign-in has not been configured yet.');
       return;
     }
-    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : (raidPath || ['/settings','/automod','/honeypot','/community','/links'].includes(path)) ? 'GET, POST' : 'GET';
+    const expectedMethod = (caseMutation || starboardMutation || ['/auth/logout', '/settings/test-log'].includes(path)) ? 'POST' : (raidPath || ['/settings','/automod','/honeypot','/community','/links','/chat-clear'].includes(path)) ? 'GET, POST' : 'GET';
     if (!expectedMethod.split(', ').includes(request.method ?? '')) {
       response.setHeader('Allow', expectedMethod);
       message(response, 405, 'Method not allowed', 'Use the dashboard controls to continue.');
@@ -275,6 +278,13 @@ export function createDashboardHandler(options: Options) {
       response.setHeader('Set-Cookie', cookie(sessionName, '', 0, config.secure));
       message(response, 403, 'Staff access required', 'Your current roles no longer provide access. Please contact an Admin.');
       return;
+    }
+    if (path === '/chat-clear') {
+      if (!options.readChatClearResources) throw new Error('CHAT_CLEAR_RESOURCES_UNAVAILABLE');
+      await handleChatClearPage(request, { pool, guildId, actorId: session.user_id, token: sessionToken, origin: config.origin, access,
+        readRoles: readMemberRoles, readResources: options.readChatClearResources }, {
+        html: (status, render) => html(response, status, render), redirect: location => redirect(response, location),
+      }); return;
     }
     if (path === '/links') {
       if (!options.readAutoModResources) throw new Error('LINK_RESOURCES_UNAVAILABLE');

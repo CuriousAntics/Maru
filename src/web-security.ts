@@ -91,3 +91,7 @@ export function raidProof(token: string,action: string,scope: string): string {
 export function linkSettingsProof(token: string,section: string,revision: number,sharedRevision: number): string {
  return createHmac('sha256',token).update(`maru-links:${section}:${revision}:${sharedRevision}`).digest('base64url');
 }
+
+export function chatClearProof(token: string, revision: number): string {
+  return createHmac('sha256', token).update(`maru-chat-clear:${revision}`).digest('base64url');
+}

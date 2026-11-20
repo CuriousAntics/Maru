@@ -76,3 +76,7 @@ The Raid response page configures designated ordinary invites and builds a fixed
 ## Link protection
 
 Link protection has separate saves for repeated URLs and known scam-domain matching, with shared AutoMod exemptions and per-rule overrides. Both default Off. See [link-protection.md](link-protection.md) for normalization, configurable 12-hour link punishment, unverified review logging, provider limits and deferred live checks.
+
+## Scheduled voice-channel chat clear
+
+`/chat-clear` configures periodic clearing of one voice channel's text chat (default Off, every 6 hours, adjustable from 1–720 whole hours). Admins and full-access Mods can save; ordinary Mods can view. Pins are always preserved. Quiet countdown notices appear about 5 minutes, 1 minute and 10 seconds before the clear. The page shows the next UTC deadline, countdown delivery and sweep history. See [scheduled-chat-clear.md](scheduled-chat-clear.md) for recovery, permissions and private-server acceptance checks. Requires migration `018_scheduled_chat_clear.sql` before startup.
