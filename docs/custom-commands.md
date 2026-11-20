@@ -28,3 +28,7 @@ Guild and row locks serialize configuration saves, revisions reject stale forms,
 Apply migration 019 before starting this build. Confirm the new dashboard page loads with no commands enabled. In the private development server, add `/magic` with a disposable response, enable it, wait for synchronization and invoke **Maru's** command as a nonstaff member. Confirm its response is public, then test emoji/media responses, an edit, Off, and removal. Keep Dyno unchanged during acceptance; no commands are imported automatically from screenshots. Configure the remaining saved responses from their original text once the first command passes. Live acceptance remains pending, separate from the scheduled-clear test already underway and the expired-invite tests deferred by the user.
 
 References: [Discord application commands](https://docs.discord.com/developers/interactions/application-commands), [interaction responses](https://docs.discord.com/developers/interactions/receiving-and-responding).
+
+## Optional triggers inside ordinary messages
+
+Migration 020 adds an independent, default-Off in-message trigger switch to each command, reusing its response for complete `/name` words anywhere in new human messages. Native slash-command behavior remains available as before. See [inline-command-triggers.md](inline-command-triggers.md) for boundaries, cooldowns, job outcomes and live acceptance.
