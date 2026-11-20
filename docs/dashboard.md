@@ -80,3 +80,7 @@ Link protection has separate saves for repeated URLs and known scam-domain match
 ## Scheduled voice-channel chat clear
 
 `/chat-clear` configures periodic clearing of one voice channel's text chat (default Off, every 6 hours, adjustable from 1–720 whole hours). Admins and full-access Mods can save; ordinary Mods can view. Pins are always preserved. Quiet countdown notices appear about 5 minutes, 1 minute and 10 seconds before the clear. The page shows the next UTC deadline, countdown delivery and sweep history. See [scheduled-chat-clear.md](scheduled-chat-clear.md) for recovery, permissions and private-server acceptance checks. Requires migration `018_scheduled_chat_clear.sql` before startup.
+
+## Custom slash-command responses
+
+`/custom-commands` manages saved public text/emoji/media-link responses such as `/magic`. New entries default Off; Admins and full-access Mods may manage them and ordinary Mods may view. Enabled commands are available to all members subject to Discord permissions. Maru synchronizes individual guild slash-command registrations in the background, preserving built-ins and unrelated commands. See [custom-commands.md](custom-commands.md) for registration recovery and live acceptance. Requires migration `019_custom_slash_responses.sql` before startup.

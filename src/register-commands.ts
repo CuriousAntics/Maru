@@ -1,5 +1,5 @@
 import { REST, Routes } from 'discord.js';
-import { ping, staffCheck, staffAccess, warn, caseLookup, timeout, untimeout, ban, unban } from './commands.js';
+import { builtInCommands } from './commands.js';
 import { required, snowflake } from './config.js';
 
 try {
@@ -7,7 +7,7 @@ try {
   const guildId = snowflake('DISCORD_TEST_GUILD_ID');
   const rest = new REST({ version: '10' }).setToken(required('DISCORD_TOKEN'));
   // Upsert these commands individually, preserving unrelated commands.
-  for (const command of [ping, staffCheck, staffAccess, warn, caseLookup, timeout, untimeout, ban, unban]) {
+  for (const command of builtInCommands) {
     await rest.post(Routes.applicationGuildCommands(applicationId, guildId), {
       body: command.toJSON(),
     });
