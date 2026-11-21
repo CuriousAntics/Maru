@@ -7,9 +7,10 @@ import type { AddressInfo } from 'node:net';
 import type { Pool } from 'pg';
 import type { Interaction } from 'discord.js';
 import { PGlite } from '@electric-sql/pglite';
-import { saveForm, startForm, loadDraft, submitFormStep, reviewForm, queueFormPost, validateForm } from '../src/forms.js';
+import { saveForm, startForm, loadDraft, submitFormStep, reviewForm, queueFormPost, validateForm, deleteForm, saveAndPublishForm } from '../src/forms.js';
 import type { Form, Question, Answer, Entry } from '../src/forms.js';
-import { formModal, handleFormInteraction, downloadFormFile } from '../src/forms-discord.js';
+import { formModal, handleFormInteraction, downloadFormFile, formInteractionIdentity, formIdentityReader } from '../src/forms-discord.js';
+import { answerColumns, answersTable, enrichFormIdentities, formUser } from '../src/form-responses.js';
 import { deliverForms } from '../src/forms-worker.js';
 import type { FormsDelivery } from '../src/forms-worker.js';
 import { createDashboardHandler } from '../src/dashboard.js';
@@ -159,9 +160,9 @@ test('interrupted sends become unknown on restart and are not retried',async()=>
 test('website builds, preserves question order and queues publication',async()=>{
   let response=await post('/forms',builder());assert.equal(response.status,303);
   response=await request('/forms?edit='+id);const html=await response.text();assert.match(html,/Fill out form/);assert.match(html,/File upload/);assert.match(html,/Publish form post/);
-  const p=new URLSearchParams({csrf:formProof(token,`publish:${id}:1`),id,revision:'1',action:'publish',request_id:randomUUID(),channel});assert.equal((await post('/forms',p)).status,303);
-  const build=builder();build.set('revision','1');build.set('csrf',formProof(token,`build:${id}:1`));build.set('action','add');
-  const added=await post('/forms',build);assert.equal(added.status,200);assert.match(await added.text(),/Question 2/);assert.equal((await query('SELECT revision FROM forms')).rows[0].revision,1);
+  const p=builder();p.set('csrf',formProof(token,`build:${id}:1`));p.set('revision','1');p.set('action','publish');p.set('request_id',randomUUID());p.set('channel',channel);assert.equal((await post('/forms',p)).status,303);
+  const build=builder();build.set('revision','2');build.set('csrf',formProof(token,`build:${id}:2`));build.set('action','add');
+  const added=await post('/forms',build);assert.equal(added.status,200);assert.match(await added.text(),/Question 2/);assert.equal((await query('SELECT revision FROM forms')).rows[0].revision,2);
 });
 test('website rejects cross-origin requests, bad proofs and duplicate fields',async()=>{
   assert.equal((await post('/forms',builder(),'https://example.com')).status,403);
@@ -210,10 +211,10 @@ test('Discord modal submission collects all five types and persists uploaded byt
      {type:18,component:{type:19,customId:'q4',attachments:new Collection([['800000000000000001',{name:'portfolio.txt',size:9,url:'https://cdn.discordapp.com/attachments/1/2/portfolio.txt'}]])}}]
   ]);
   const replies:any[]=[],interactionId=String(++interaction);let deferred=false,downloads=0;
-  const modal={id:interactionId,customId:`forms:submit:${draft.id}:0`,guildId:guild,member:{},user:{id:user,bot:false},fields,isButton:()=>false,isModalSubmit:()=>true,get deferred(){return deferred;},replied:false,deferReply:async()=>{deferred=true;},editReply:async(v:any)=>replies.push(v),reply:async(v:any)=>replies.push(v)} as unknown as Interaction;
+  const modal={id:interactionId,customId:`forms:submit:${draft.id}:0`,guildId:guild,member:{nick:'Mandy Server'},user:{id:user,bot:false,username:'mandy',globalName:'Mandy Global'},fields,isButton:()=>false,isModalSubmit:()=>true,get deferred(){return deferred;},replied:false,deferReply:async()=>{deferred=true;},editReply:async(v:any)=>replies.push(v),reply:async(v:any)=>replies.push(v)} as unknown as Interaction;
   const fetcher=(async()=>{downloads++;return new Response('Portfolio');}) as typeof fetch;
   await handleFormInteraction(modal,pool,guild,fetcher);
-  const e=await getEntry(draft.id);assert.equal(e.state,'pending');assert.deepEqual(e.answers.slice(0,4).map(a=>a.value),['Short answer','Paragraph answer',['B'],['Red','Blue']]);
+  const e=await getEntry(draft.id);assert.equal(e.state,'pending');assert.equal(e.username,'mandy');assert.equal(e.display_name,'Mandy Server');assert.deepEqual(e.answers.slice(0,4).map(a=>a.value),['Short answer','Paragraph answer',['B'],['Red','Blue']]);
   assert.match(replies[0].content,/submitted/);assert.equal(Buffer.from((await query('SELECT data FROM form_files')).rows[0].data).toString(),'Portfolio');
   await handleFormInteraction(modal,pool,guild,fetcher);assert.equal(downloads,1);assert.equal((await query('SELECT * FROM form_entries')).rowCount,1);
 });
@@ -230,4 +231,218 @@ test('draft attachment cannot be downloaded before final submission',async()=>{
   await save({questions:[q({type:'file'}),...Array.from({length:5},()=>q())]});const e=await startForm(pool,guild,id,user),fileId=randomUUID();
   await step(e,[{...answer(q({type:'file'}),''),fileId,filename:'draft.txt'},...Array.from({length:4},()=>answer())],[{id:fileId,filename:'draft.txt',data:Buffer.from('private draft')}]);
   assert.equal((await request('/forms/files/'+fileId)).status,404);assert.equal((await request('/forms/responses/'+e.id)).status,404);
+});
+
+const removeForm=(patch={})=>deleteForm(pool,{...context(),id,revision:1,retention:'keep',confirmation:'DELETE',...patch});
+test('deleting a form hides it and closes old buttons while retaining reviewable responses',async()=>{
+  const e=await submit();await removeForm();
+  const form=(await query('SELECT * FROM forms')).rows[0];assert.equal(form.deleted,true);assert.equal(form.enabled,false);
+  await assert.rejects(startForm(pool,guild,id,user),/CLOSED/);await assert.rejects(save({},2),/NOT_FOUND/);
+  assert.equal((await getEntry(e.id)).state,'pending');assert.equal((await request('/forms/responses/'+e.id)).status,200);
+  const html=await (await request('/forms?edit='+id)).text();assert.doesNotMatch(html,/Edit form/);assert.match(html,/Staff applications \(deleted\)/);
+  await reviewForm(pool,{...context(),id:e.id,revision:1,decision:'approved',message:'Retained review'});
+  await removeForm({retention:'purge'});assert.equal((await getEntry(e.id)).state,'approved');
+});
+test('deletion purges submitted responses and files only when explicitly selected',async()=>{
+  const question=q({type:'file'});await save({questions:[question]});const e=await startForm(pool,guild,id,user),fileId=randomUUID();
+  await step(e,[{...answer(question,''),fileId,filename:'sample.txt'}],[{id:fileId,filename:'sample.txt',data:Buffer.from('sample')}]);
+  await removeForm({retention:'purge'});
+  for(const table of ['form_entries','form_files','form_steps'])assert.equal((await query('SELECT * FROM '+table)).rowCount,0);
+  assert.equal((await request('/forms/files/'+fileId)).status,404);
+});
+test('deletion always discards unfinished drafts and their files',async()=>{
+  const questions=[q({type:'file'}),...Array.from({length:5},()=>q())];await save({questions});
+  const draft=await startForm(pool,guild,id,user),fileId=randomUUID();
+  await step(draft,[{...answer(questions[0]!,''),fileId,filename:'draft.txt'},...questions.slice(1,5).map(q=>answer(q))],[{id:fileId,filename:'draft.txt',data:Buffer.from('draft')}]);
+  await removeForm();assert.equal((await query('SELECT * FROM form_entries')).rowCount,0);assert.equal((await query('SELECT * FROM form_files')).rowCount,0);
+});
+test('deleting requires current full access, confirmation and a live session',async()=>{
+  await save();roles=[mod];await assert.rejects(removeForm(),/STAFF_REQUIRED/);roles=[admin];
+  await assert.rejects(removeForm({confirmation:''}),/DELETE_CONFIRMATION/);await assert.rejects(removeForm({retention:'other'}),/DELETE_CONFIRMATION/);
+  await query('DELETE FROM dashboard_sessions');await assert.rejects(removeForm(),/SESSION_EXPIRED/);
+  assert.equal((await query('SELECT deleted FROM forms')).rows[0].deleted,false);
+});
+test('stale deletion and in-flight publication are rejected; audit failure rolls back deletion',async()=>{
+  await save();await save({},1);await assert.rejects(removeForm(),/STALE/);
+  const publication={...context(),id:randomUUID(),formId:id,revision:2,channelId:channel,readChannels:deps.readChannels};await queueFormPost(pool,publication);
+  await query("UPDATE form_publications SET status='sending'");await assert.rejects(removeForm({revision:2}),/BUSY/);
+  await query("UPDATE form_publications SET status='pending'");const e=await startForm(pool,guild,id,user);
+  failAudit=true;await assert.rejects(removeForm({revision:2}));failAudit=false;
+  assert.equal((await query('SELECT deleted FROM forms')).rows[0].deleted,false);assert.ok(await getEntry(e.id));assert.equal((await query('SELECT status FROM form_publications')).rows[0].status,'pending');
+});
+test('deletion cancels queued posts without sending them',async()=>{
+  await save();await queueFormPost(pool,{...context(),id:randomUUID(),formId:id,revision:1,channelId:channel,readChannels:deps.readChannels});
+  await removeForm();await deliverForms(pool,guild,deps);assert.deepEqual(deliveries,[]);assert.equal((await query('SELECT status FROM form_publications')).rows[0].status,'failed');
+});
+test('HTTP delete confirmation is separate, scoped, protected and defaults to keeping responses',async()=>{
+  const e=await submit();let response=await request('/forms/delete/'+id);assert.equal(response.status,200);let html=await response.text();assert.match(html,/Saved submissions: 1/);assert.match(html,/<option value="keep">Keep/);
+  const p=new URLSearchParams({csrf:formProof(token,`delete:${id}:1`),revision:'1',retention:'keep',confirmation:'DELETE'});
+  assert.equal((await post('/forms/delete/'+id,p,'https://example.com')).status,403);
+  const wrong=new URLSearchParams(p);wrong.set('csrf',formProof(token,`build:${id}:1`));assert.equal((await post('/forms/delete/'+id,wrong)).status,403);
+  wrong.set('csrf',p.get('csrf')!);wrong.set('confirmation','');assert.equal((await post('/forms/delete/'+id,wrong)).status,409);
+  roles=[mod];assert.equal((await request('/forms/delete/'+id)).status,403);assert.equal((await post('/forms/delete/'+id,p)).status,403);roles=[admin];
+  assert.equal((await post('/forms/delete/'+id,p)).status,303);assert.equal((await request('/forms/responses/'+e.id)).status,200);
+});
+test('builder actions identify their question anchors and dashboard script uses its CSP nonce',async()=>{
+  await save({questions:[q(),q({label:'Second question'})]});const response=await request('/forms?edit='+id),html=await response.text();
+  assert.match(html,/id="question-0"/);assert.match(html,/data-scroll-anchor="question-2"/);assert.match(html,/formaction="[^"]+#question-2"/);
+  const nonce=/<script nonce="([^"]+)">/.exec(html)?.[1];assert.ok(nonce);assert.match(response.headers.get('content-security-policy')!,new RegExp("script-src 'nonce-"+nonce+"'"));
+});
+
+test('retained submitted files remain downloadable after form deletion',async()=>{
+  const question=q({type:'file'});await save({questions:[question]});const e=await startForm(pool,guild,id,user),fileId=randomUUID();
+  await step(e,[{...answer(question,''),fileId,filename:'retained.txt'}],[{id:fileId,filename:'retained.txt',data:Buffer.from('retained bytes')}]);
+  await removeForm();const response=await request('/forms/files/'+fileId);assert.equal(response.status,200);assert.equal(await response.text(),'retained bytes');
+});
+
+function publishBuilder(revision=1) {
+  const p=builder();p.set('revision',String(revision));p.set('csrf',formProof(token,`build:${id}:${revision}`));p.set('action','publish');p.set('request_id',randomUUID());p.set('channel',channel);return p;
+}
+function addQuestion(p:URLSearchParams,n:number,question:Question) {
+  p.set('q'+n+'_label',question.label);p.set('q'+n+'_type',question.type);p.set('q'+n+'_required',String(question.required));p.set('q'+n+'_options',question.options.join('\n'));
+}
+test('publish saves all newly added question types from the builder before queuing Discord',async()=>{
+  await save();const p=publishBuilder(),questions=[q({type:'short'}),q({label:'New paragraph'}),q({type:'choice',label:'Area',options:['Art','Programming','Both']}),q({type:'checkboxes',label:'Tools',options:['Blender','Houdini']}),q({type:'file',label:'Upload sample'})];
+  p.set('count','5');questions.forEach((q,n)=>addQuestion(p,n,q));
+  assert.equal((await post('/forms?edit='+id,p)).status,303);
+  const saved=(await query('SELECT * FROM forms')).rows[0];assert.equal(saved.revision,2);assert.deepEqual(saved.questions,questions);
+  const publication=(await query('SELECT * FROM form_publications')).rows[0];assert.equal(publication.form_revision,2);
+  await deliverForms(pool,guild,deps);assert.equal(deliveries.length,1);assert.deepEqual((await startForm(pool,guild,id,user)).snapshot.questions,questions);
+  const page=await request('/forms?edit='+id+'&published=1');assert.match(await page.text(),/Saved all 5 questions/);
+});
+test('adding and moving unsaved questions then publishing retains every field and its order',async()=>{
+  await save();const p=publishBuilder();p.set('action','add');assert.equal((await post('/forms',p)).status,200);
+  p.set('count','2');addQuestion(p,0,q({label:'Original edited'}));addQuestion(p,1,q({label:'Added before publish',type:'choice',options:['A','B']}));p.set('action','up:1');
+  let response=await post('/forms',p),html=await response.text();assert.ok(html.indexOf('value="Added before publish"')<html.indexOf('value="Original edited"'));
+  addQuestion(p,0,q({label:'Added before publish',type:'choice',options:['A','B']}));addQuestion(p,1,q({label:'Original edited'}));p.set('action','publish');
+  assert.equal((await post('/forms',p)).status,303);assert.deepEqual(((await query('SELECT questions FROM forms')).rows[0].questions as Question[]).map(q=>q.label),['Added before publish','Original edited']);
+});
+test('publish button and channel use the same builder form; Enter defaults to Save',async()=>{
+  await save();const html=await (await request('/forms?edit='+id)).text();
+  assert.equal((html.match(/id="form-builder"/g)??[]).length,1);assert.match(html,/<button name="action" value="publish" form="form-builder">Publish form post/);
+  assert.match(html,/<select id="channel" name="channel" form="form-builder">/);
+  const editor=html.slice(html.indexOf('<form id="form-builder"'));assert.match(editor.slice(0,editor.indexOf('</form>')),/<legend>[^<]+<\/legend><button name="action" value="save">/);
+});
+test('a new form can be saved and published in one operation',async()=>{
+  const p=publishBuilder(0);assert.equal((await post('/forms?new=1',p)).status,303);
+  assert.equal((await query('SELECT revision FROM forms')).rows[0].revision,1);assert.equal((await query('SELECT form_revision FROM form_publications')).rows[0].form_revision,1);
+});
+test('invalid publish channel retains unsaved questions and leaves saved settings unchanged',async()=>{
+  await save();const p=publishBuilder();p.set('count','2');addQuestion(p,1,q({label:'Unsaved question'}));p.set('channel','');
+  const response=await post('/forms',p);assert.equal(response.status,409);const html=await response.text();assert.match(html,/value="Unsaved question"/);assert.match(html,/Question 2/);
+  assert.equal(((await query('SELECT questions FROM forms')).rows[0].questions as Question[]).length,1);assert.equal((await query('SELECT * FROM form_publications')).rowCount,0);
+});
+test('invalid choice options keep all current edits visible and do not queue an older version',async()=>{
+  await save();const p=publishBuilder();p.set('count','2');addQuestion(p,1,q({label:'Choose one',type:'choice',options:['Only one option']}));
+  const response=await post('/forms',p);assert.equal(response.status,409);const html=await response.text();assert.match(html,/value="Choose one"/);assert.match(html,/Only one option/);assert.equal((await query('SELECT * FROM form_publications')).rowCount,0);
+});
+test('save-and-publish rolls back all questions when its final audit event fails',async()=>{
+  await save();
+  const failing={...pool,connect:async()=>({query:async(sql:string,values?:unknown[])=>{if(sql.includes('INSERT INTO audit_events')&&values?.[2]==='FORM_POST_QUEUED')throw new Error('publication audit failed');return query(sql,values);},release(){}})} as unknown as Pool;
+  await assert.rejects(saveAndPublishForm(failing,{...context(),id,revision:1,form:config({questions:[q(),q({label:'Must roll back'})]}),requestId:randomUUID(),channelId:channel,readChannels:deps.readChannels}));
+  const saved=(await query('SELECT * FROM forms')).rows[0];assert.equal(saved.revision,1);assert.equal((saved.questions as Question[]).length,1);assert.equal((await query('SELECT * FROM form_publications')).rowCount,0);
+});
+test('double-clicking publish does not save a second revision or queue a duplicate post',async()=>{
+  await save();const p=publishBuilder();assert.equal((await post('/forms',p)).status,303);assert.equal((await post('/forms',p)).status,303);
+  assert.equal((await query('SELECT revision FROM forms')).rows[0].revision,2);assert.equal((await query('SELECT * FROM form_publications')).rowCount,1);
+  await deliverForms(pool,guild,deps);await deliverForms(pool,guild,deps);assert.equal(deliveries.length,1);
+});
+test('closed or stale editor cannot save-and-publish over the current form',async()=>{
+  await save();let p=publishBuilder();p.set('enabled','false');assert.equal((await post('/forms',p)).status,409);assert.equal((await query('SELECT enabled FROM forms')).rows[0].enabled,true);
+  await save({title:'Changed in another tab'},1);p=publishBuilder();const response=await post('/forms',p);assert.equal(response.status,409);assert.equal((await query('SELECT title FROM forms')).rows[0].title,'Changed in another tab');assert.equal((await query('SELECT * FROM form_publications')).rowCount,0);
+});
+test('publish still requires current full staff access and builder CSRF proof',async()=>{
+  await save();const p=publishBuilder();roles=[mod];assert.equal((await post('/forms',p)).status,403);roles=[admin];p.set('csrf',formProof(token,`publish:${id}:1`));assert.equal((await post('/forms',p)).status,403);
+  assert.equal((await query('SELECT revision FROM forms')).rows[0].revision,1);assert.equal((await query('SELECT * FROM form_publications')).rowCount,0);
+});
+
+test('reusing a publish request with changed questions is rejected instead of silently losing edits',async()=>{
+  await save();const p=publishBuilder();assert.equal((await post('/forms',p)).status,303);
+  p.set('count','2');addQuestion(p,1,q({label:'Different questions on repeated request'}));const response=await post('/forms',p);assert.equal(response.status,409);assert.match(await response.text(),/Different questions on repeated request/);
+  assert.equal((await query('SELECT * FROM form_publications')).rowCount,1);
+});
+
+async function namedSubmit(username='mandy',displayName='Mandy') {
+  await save();const e=await startForm(pool,guild,id,user);
+  return submitFormStep(pool,{guildId:guild,id:e.id,userId:user,step:0,interactionId:String(++interaction),answers:[answer()],files:[],identity:{username,displayName}});
+}
+function withIdentityReader(readFormIdentity:any) {
+  handler=createDashboardHandler({pool,guildId:guild,config:{origin:base,applicationId:bot,clientSecret:'fake',secure:false},isBotReady:()=>true,readMemberRoles:async()=>roles,readFormIdentity});
+}
+test('submission records display name and username from Discord, alongside the stable user ID',async()=>{
+  const e=await namedSubmit();assert.equal(e.username,'mandy');assert.equal(e.display_name,'Mandy');assert.equal(e.user_id,user);assert.equal(e.identity_source,'submission');
+  let calls=0;withIdentityReader(async()=>{calls++;return {username:'renamed',displayName:'New name'};});
+  const response=await request('/forms/responses/'+e.id),html=await response.text();assert.equal(response.status,200);assert.match(html,/@mandy/);assert.match(html,/Mandy/);assert.match(html,new RegExp(user));assert.equal(calls,0);
+});
+test('submission-time identity is captured at the final section and replay does not replace it',async()=>{
+  const questions=Array.from({length:6},()=>q());await save({questions});let entry=await startForm(pool,guild,id,user);
+  entry=await step(entry,questions.slice(0,5).map(q=>answer(q)));assert.equal(entry.username,null);
+  const input={guildId:guild,id:entry.id,userId:user,step:1,interactionId:String(++interaction),answers:[answer()],files:[],identity:{username:'final_name',displayName:'Final name'}};
+  await submitFormStep(pool,input);await submitFormStep(pool,{...input,identity:{username:'later_name',displayName:'Later'}});assert.equal((await getEntry(entry.id)).username,'final_name');
+});
+test('Discord identity prefers server nickname, then global display name, then username',()=>{
+  const i=(member:any,userPatch={})=>({member,user:{id:user,username:'mandy',globalName:'Mandy Global',...userPatch}}) as any;
+  assert.deepEqual(formInteractionIdentity(i({nickname:'Server Nick'})),{username:'mandy',displayName:'Server Nick'});
+  assert.equal(formInteractionIdentity(i({nick:'API Nick'}))?.displayName,'API Nick');assert.equal(formInteractionIdentity(i({nick:null}))?.displayName,'Mandy Global');assert.equal(formInteractionIdentity(i({}, {globalName:null}))?.displayName,'mandy');
+});
+test('legacy ID-only submissions get labelled lookup names without changing saved answers',async()=>{
+  const e=await submit();let calls=0;withIdentityReader(async(uid:string)=>{calls++;assert.equal(uid,user);return {username:'mandy_now',displayName:'Mandy Today'};});
+  const html=await (await request('/forms/responses/'+e.id)).text();assert.match(html,/@mandy_now/);assert.match(html,/Name retrieved after submission/);assert.match(html,/My answer/);
+  assert.equal((await getEntry(e.id)).identity_source,'lookup');await request('/forms/responses/'+e.id);assert.equal(calls,1);
+});
+test('unavailable legacy profiles keep answers accessible and back off repeated lookups',async()=>{
+  const e=await submit();let calls=0;withIdentityReader(async()=>{calls++;throw new Error('unavailable');});
+  let response=await request('/forms/responses/'+e.id);assert.equal(response.status,200);assert.match(await response.text(),/Name unavailable/);
+  response=await request('/forms/responses/'+e.id);assert.equal(response.status,200);assert.equal(calls,1);assert.equal((await getEntry(e.id)).username,null);
+});
+test('legacy identity enrichment is scoped to the configured guild and only submitted responses',async()=>{
+  const e=await submit(),otherGuild='100000000000000009';await query('INSERT INTO guild_settings(guild_id) VALUES ($1)',[otherGuild]);
+  await query("INSERT INTO forms(guild_id,id,title,description,questions,enabled,revision,updated_by) VALUES ($1,$2,'Other','',$3::jsonb,TRUE,1,$4)",[otherGuild,id,JSON.stringify([q()]),actor]);
+  await query("INSERT INTO form_entries(guild_id,id,form_id,user_id,snapshot,state,submitted_at) VALUES ($1,$2,$3,$4,$5::jsonb,'pending',NOW())",[otherGuild,randomUUID(),id,user,JSON.stringify(config())]);
+  await enrichFormIdentities(pool,guild,[e],async()=>({username:'mandy',displayName:'Mandy'}));
+  assert.equal((await getEntry(e.id)).username,'mandy');assert.equal((await query('SELECT username FROM form_entries WHERE guild_id=$1',[otherGuild])).rows[0].username,null);
+});
+test('answers table displays one response per row with identity and question-answer columns',async()=>{
+  await namedSubmit();const response=await request('/forms?view=answers&status=all&form='+id),html=await response.text();assert.equal(response.status,200);assert.match(html,/Form answers — scroll horizontally/);assert.match(html,/<th>Why apply\?/);assert.match(html,/My answer/);assert.match(html,/@mandy/);assert.match(html,/Open response/);
+});
+test('answer columns match labels and types across reordered, renamed and removed questions',()=>{
+  const current=[q({label:'B'}),q({label:'Renamed A'})],old=[q({label:'A'}),q({label:'B'})];const columns=answerColumns(current,[old]);
+  assert.deepEqual(columns.map(c=>c.label),['B','Renamed A','A']);
+  const e={id:randomUUID(),user_id:user,submitted_at:new Date(),state:'pending',dm_status:'none',answers:[answer(old[0]!,'Old A answer'),answer(old[1]!,'B answer')]} as Entry;
+  const html=answersTable([e],columns),row=html.slice(html.indexOf('<tbody>'));assert.ok(row.indexOf('B answer')<row.indexOf('Old A answer'));assert.match(row,/>—<\/span>/);
+});
+test('duplicate question labels get separate numbered columns rather than overwriting answers',()=>{
+  const columns=answerColumns([q({label:'Same'}),q({label:'Same'})],[]);assert.equal(columns.length,2);assert.notEqual(columns[0]!.key,columns[1]!.key);
+  const e={id:randomUUID(),user_id:user,submitted_at:new Date(),state:'pending',dm_status:'none',answers:[answer(q({label:'Same'}),'First'),answer(q({label:'Same'}),'Second')]} as Entry;
+  const html=answersTable([e],columns);assert.match(html,/Same \(2\)/);assert.match(html,/First/);assert.match(html,/Second/);
+});
+test('answer tables include file downloads, checkbox values and expandable full paragraphs',()=>{
+  const questions=[q({type:'file',label:'File'}),q({type:'checkboxes',label:'Tools',options:['Blender','Houdini']}),q({label:'Paragraph'})],fileId=randomUUID();
+  const text='Long paragraph '.repeat(30),e={id:randomUUID(),user_id:user,submitted_at:new Date(),state:'pending',dm_status:'none',answers:[{...answer(questions[0]!,''),fileId,filename:'sample.txt'},answer(questions[1]!,['Blender','Houdini']),answer(questions[2]!,text)]} as Entry;
+  const html=answersTable([e],answerColumns(questions,[]));assert.match(html,new RegExp('/forms/files/'+fileId));assert.match(html,/Blender\nHoudini/);assert.match(html,/<details>/);assert.ok(html.includes(text));
+});
+test('form table headers stay consistent across status filters and include earlier questions',async()=>{
+  const e=await submit();await reviewForm(pool,{...context(),id:e.id,revision:1,decision:'approved',message:''});await save({questions:[q({label:'Changed question'})]},1);
+  for(const status of ['all','pending','approved']){const html=await (await request('/forms?view=answers&status='+status+'&form='+id)).text();assert.match(html,/<th>Changed question/);assert.match(html,/<th>Why apply\?/);}
+});
+test('identity and answer table values are HTML escaped',async()=>{
+  const e=await namedSubmit('<script>name</script>','<img src=x onerror=alert(1)>');await query('UPDATE form_entries SET answers=$3::jsonb WHERE guild_id=$1 AND id=$2',[guild,e.id,JSON.stringify([answer(q(),'<script>answer</script>')])]);
+  const html=await (await request('/forms?view=answers&status=all&form='+id)).text();assert.doesNotMatch(html,/<script>name|<script>answer|<img src=x/);assert.match(html,/&lt;script&gt;answer/);assert.match(html,/@&lt;script&gt;name/);
+});
+test('name reader uses current member identity and falls back to account lookup for departed users',async()=>{
+  const calls:string[]=[];let departed=false;const client={rest:{get:async(route:string)=>{calls.push(route);if(route.includes('/members/')){if(departed)throw {code:10007};return {nick:'Server name',user:{id:user,username:'mandy',global_name:'Global'}};}return {id:user,username:'mandy',global_name:'Global'};}}} as any;
+  const read=formIdentityReader(client,guild);assert.deepEqual(await read(user),{username:'mandy',displayName:'Server name'});assert.equal(calls.length,1);departed=true;assert.deepEqual(await read(user),{username:'mandy',displayName:'Global'});assert.equal(calls.length,3);
+});
+test('name reader rejects mismatched account IDs and handles lookup errors without guessing',async()=>{
+  assert.equal(await formIdentityReader({rest:{get:async()=>({user:{id:actor,username:'wrong'}})}} as any,guild)(user),null);
+  assert.equal(await formIdentityReader({rest:{get:async()=>{throw new Error('network');}}} as any,guild)(user),null);
+});
+test('answers table stays staff-only and supports retained responses of deleted forms',async()=>{
+  await namedSubmit();await removeForm();let response=await request('/forms?view=answers&status=all&form='+id);assert.equal(response.status,200);assert.match(await response.text(),/My answer/);roles=[];assert.equal((await request('/forms?view=answers&status=all&form='+id)).status,403);
+});
+test('answers-table pagination retains its form, status and view filters',async()=>{
+  await save();const snapshot=JSON.stringify({...config(),id,revision:1});
+  for(let n=0;n<51;n++)await query("INSERT INTO form_entries(guild_id,id,form_id,user_id,snapshot,answers,state,submitted_at,username,display_name,identity_source) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,'pending',NOW()-($7::integer*INTERVAL '1 second'),'mandy','Mandy','submission')",[guild,randomUUID(),id,user,snapshot,JSON.stringify([answer()]),n]);
+  const html=await (await request('/forms?view=answers&status=pending&form='+id)).text();assert.match(html,new RegExp('form='+id+'&amp;view=answers&amp;page=1'));
+  const next=await (await request('/forms?view=answers&status=pending&form='+id+'&page=1')).text();assert.match(next,/My answer/);assert.match(next,new RegExp('status=pending&amp;form='+id+'&amp;view=answers'));
 });

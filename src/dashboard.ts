@@ -1,3 +1,4 @@
+import type { ReadFormIdentity } from './form-responses.js';
 import { handleFormsPage } from './forms-web.js';
 import { handleCustomCommandPage } from './custom-command-web.js';
 import { handleChatClearPage } from './chat-clear-web.js';
@@ -37,6 +38,7 @@ type Options = {
   config?: DashboardConfig;
   isBotReady: () => boolean;
   readMemberRoles: (userId: string) => Promise<string[] | null>;
+  readFormIdentity?: ReadFormIdentity;
   readLogChannels?: () => Promise<LogChannel[]>;
   scamFeedStatus?: () => ScamFeedStatus;
   raidDependencies?: RaidDependencies;
@@ -57,7 +59,7 @@ function headers(response: ServerResponse, nonce: string): void {
   response.setHeader('X-Frame-Options', 'DENY');
   response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   response.setHeader('Content-Security-Policy',
-    `default-src 'none'; style-src 'nonce-${nonce}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`);
+    `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`);
 }
 
 function html(response: ServerResponse, status: number, render: (nonce: string) => string): void {
@@ -93,7 +95,7 @@ export function createDashboardHandler(options: Options) {
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
     const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community', '/links', '/chat-clear', '/custom-commands', '/forms'];
-    const formsPath = /^\/forms(?:\/(?:responses|files)\/[0-9a-f-]{36})?$/.test(path);
+    const formsPath = /^\/forms(?:\/(?:responses|files|delete)\/[0-9a-f-]{36})?$/.test(path);
     const raidPath = /^\/raids(?:\/[^/]+)?$/.test(path);
     const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save|delete|delete-confirm))?)?$/.test(path);
     const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save|delete)$/.test(path);
@@ -284,7 +286,7 @@ export function createDashboardHandler(options: Options) {
     }
     if (formsPath) {
       await handleFormsPage(request, { pool, guildId, actorId: session.user_id, token: sessionToken, origin: config.origin, access,
-        readRoles: readMemberRoles, readChannels: options.readLogChannels }, {
+        readRoles: readMemberRoles, readChannels: options.readLogChannels, readIdentity: options.readFormIdentity }, {
         html: (status, render) => html(response, status, render), redirect: location => redirect(response, location),
         download: (filename, data) => {
           headers(response, randomToken());
