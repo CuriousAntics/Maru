@@ -1,4 +1,4 @@
-import { handleFormInteraction, formsDelivery } from './forms-discord.js';
+import { handleFormInteraction, formsDelivery, formIdentityReader } from './forms-discord.js';
 import { startFormsWorker } from './forms-worker.js';
 import { inlineCommandDependencies } from './inline-command-discord.js';
 import { startInlineCommandWorker } from './inline-commands.js';
@@ -84,6 +84,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    readFormIdentity: formIdentityReader(client, guildId),
     readChatClearResources: chatClearResources(client, guildId),
     raidDependencies: raidDeps,
     scamFeedStatus: scamFeed.status,

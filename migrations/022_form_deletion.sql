@@ -1,0 +1,2 @@
+ALTER TABLE forms ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE forms ADD CONSTRAINT forms_deleted_closed CHECK (NOT deleted OR NOT enabled);

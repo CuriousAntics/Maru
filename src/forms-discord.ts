@@ -1,10 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { MessageFlags, ModalBuilder, REST, Routes } from 'discord.js';
-import type { Interaction, APIModalInteractionResponseCallbackData, APILabelComponent, RESTPostAPIChannelMessageJSONBody } from 'discord.js';
+import type { Interaction, APIModalInteractionResponseCallbackData, APILabelComponent, RESTPostAPIChannelMessageJSONBody, Client, RESTGetAPIGuildMemberResult, RESTGetAPIUserResult } from 'discord.js';
 import type { Pool } from 'pg';
 import { FormError, startForm, loadDraft, submitFormStep } from './forms.js';
-import type { Entry, Answer, UploadedFile } from './forms.js';
+import type { Entry, Answer, UploadedFile, FormIdentity } from './forms.js';
+import type { ReadFormIdentity } from './form-responses.js';
 import type { FormsDelivery } from './forms-worker.js';
+export function formInteractionIdentity(interaction: Pick<Interaction,'user'|'member'>): FormIdentity|undefined {
+  const username=interaction.user.username?.trim().slice(0,100);
+  if(!username)return undefined;
+  const member=interaction.member;
+  const nickname=member && ('nickname' in member?member.nickname:'nick' in member?member.nick:null);
+  return {username,displayName:(nickname||interaction.user.globalName||username).trim().slice(0,100)||username};
+}
 export const nextFormButton = (e: Entry) => [{type:1 as const,components:[{type:2 as const,style:1 as const,label:e.step?'Continue':'Begin form',custom_id:`forms:next:${e.id}:${e.step}`}]}];
 export function formModal(e: Entry) {
   const components: APILabelComponent[] = e.snapshot.questions.slice(e.step*5,(e.step+1)*5).map((q,n) => {
@@ -79,7 +87,7 @@ export async function handleFormInteraction(interaction: Interaction, pool: Pick
         }
         answers.push(a);
       }
-      const saved=await submitFormStep(pool,{guildId,id:e.id,userId:interaction.user.id,step:e.step,interactionId:interaction.id,answers,files});
+      const saved=await submitFormStep(pool,{guildId,id:e.id,userId:interaction.user.id,step:e.step,interactionId:interaction.id,answers,files,identity:formInteractionIdentity(interaction)});
       await interaction.editReply(saved.state==='draft'?{content:'Section saved. Continue to the next section to finish your form.',components:nextFormButton(saved),allowedMentions:{parse:[]}}:{content:`Your form has been submitted. Reference: ${saved.id}. Staff will review it on Maru’s website. Maru will attempt to DM you their decision.`,components:[],allowedMentions:{parse:[]}});
     }
   } catch (error) {
@@ -100,4 +108,17 @@ export function formsDelivery(token: string, readChannels: FormsDelivery['readCh
     const channel=await rest.post(Routes.userChannels(),{body:{recipient_id:user},signal:AbortSignal.timeout(15000)}) as {id:string};
     return send(channel.id,body);
   }};
+}
+
+export function formIdentityReader(client: Client,guildId:string):ReadFormIdentity {
+  return async userId=>{
+    let member:RESTGetAPIGuildMemberResult|undefined;
+    try { member=await client.rest.get(Routes.guildMember(guildId,userId),{signal:AbortSignal.timeout(5000)}) as RESTGetAPIGuildMemberResult; }
+    catch(error) { if(!(error && typeof error==='object' && 'code' in error && Number(error.code)===10007)) return null; }
+    try {
+      const user=member?.user??await client.rest.get(Routes.user(userId),{signal:AbortSignal.timeout(5000)}) as RESTGetAPIUserResult;
+      if(user.id!==userId || typeof user.username!=='string' || !user.username.trim())return null;
+      return {username:user.username.trim().slice(0,100),displayName:(member?.nick||user.global_name||user.username).trim().slice(0,100)};
+    }catch{return null;}
+  };
 }
