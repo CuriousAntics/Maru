@@ -116,3 +116,9 @@ New submissions capture the member's server display name (falling back to global
 Older responses contain only IDs. When staff view them, Maru resolves up to ten unique missing respondent names per page request and stores successful lookups with a **Name retrieved after submission** label. These names were obtained later, not at the original submission. Multiple responses by one member share that lookup. If the member has left the server, Maru attempts an account lookup. Unknown/deleted accounts or temporary Discord failures show **Name unavailable** with the ID, and failures back off for 15 minutes. Answers remain accessible even when a name cannot be resolved. Refreshing or browsing more responses fills additional legacy names without changing their answers.
 
 Live checks: submit a form and verify the name, handle and ID on both the list and detail page; open Answers table and confirm all question values/files; review an older response to confirm a lookup name appears where Discord can resolve the account. No new environment variables, packages or gateway intents are required.
+
+## Save scroll repair
+
+`maru-form-scroll-repair.patch` fixes scroll-position capture for forms with controls named `action` or `target`, including the form builder's Save and Publish buttons. Named controls mask native properties on HTMLFormElement; the script now reads the form's markup attributes instead. Regression tests model a single named control, multiple controls, and a named target, while retaining the existing destination and question-anchor behavior.
+
+Apply after the Forms controls update (PR #32). No database migration, dependency update or command registration is required. After deployment, scroll to the bottom of a multi-question form, click the lower Save form button and confirm it returns to that position. Also confirm Add question still brings the new card into view.

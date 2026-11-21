@@ -7,8 +7,11 @@ export const dashboardScrollScript = `(() => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     const button = event.submitter;
-    if (form.target && form.target !== '_self' || button?.formTarget && button.formTarget !== '_self') return;
-    const target = new URL(button?.getAttribute('formaction') || form.action, location.href);
+    // Named controls (for example, buttons named "action" or inputs named "target")
+    // mask HTMLFormElement properties. Read the actual attributes, not those properties.
+    const destination = button?.getAttribute('formtarget') || form.getAttribute('target') || '_self';
+    if (destination !== '_self') return;
+    const target = new URL(button?.getAttribute('formaction') || form.getAttribute('action') || location.href, location.href);
     if (target.origin !== location.origin || target.pathname !== location.pathname && !target.pathname.startsWith(location.pathname + '/')) { forget(); return; }
     const anchor = button?.dataset.scrollAnchor;
     try { sessionStorage.setItem(key, JSON.stringify({path:location.pathname, y:scrollY, at:Date.now(), anchor:/^question-[0-9]+$/.test(anchor || '') ? anchor : null})); } catch {}
