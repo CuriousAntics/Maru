@@ -199,3 +199,27 @@ export async function deleteForm(pool: Pick<Pool,'connect'>, i: StaffContext & {
     await audit(db,i.guildId,i.actorId,'FORM_DELETED',{form_id:i.id,revision:i.revision+1,responses:i.retention,removed_entries:removed.rowCount});
   });
 }
+
+// Bind confirmation to the exact set of responses and review revisions shown.
+export function responseDeletionStamp(entries: Pick<Entry,'id'|'revision'>[]): string {
+  return digest(JSON.stringify(entries.map(e=>[e.id,e.revision]).sort((a,b)=>String(a[0]).localeCompare(String(b[0])))));
+}
+export async function deleteFormResponses(pool: Pick<Pool,'connect'>, i: StaffContext & {
+  id: string; mode: 'one'|'all'; stamp: string; confirmation: string;
+}): Promise<{formId:string;count:number}> {
+  if (!uuid(i.id) || !['one','all'].includes(i.mode) || i.confirmation!=='DELETE' || !/^[0-9a-f]{64}$/.test(i.stamp)) throw new FormError('RESPONSE_DELETE_CONFIRMATION');
+  return transaction(pool,async db=>{
+    await lockGuild(db,i.guildId); await requireFormStaff(db,i,true);
+    if(i.mode==='all' && !(await db.query('SELECT 1 FROM forms WHERE guild_id=$1 AND id=$2',[i.guildId,i.id])).rowCount) throw new FormError('NOT_FOUND');
+    // Lock rows against review and DM claims before checking or removing them.
+    const entries=(await db.query<Entry>(`SELECT id,form_id,revision,dm_status FROM form_entries
+      WHERE guild_id=$1 AND ${i.mode==='one'?'id':'form_id'}=$2 AND state<>'draft' ORDER BY id FOR UPDATE`,[i.guildId,i.id])).rows;
+    if(i.mode==='one' && !entries.length)throw new FormError('NOT_FOUND');
+    if(responseDeletionStamp(entries)!==i.stamp)throw new FormError('RESPONSES_CHANGED');
+    if(entries.some(e=>e.dm_status==='sending'))throw new FormError('RESPONSE_DELETE_BUSY');
+    const formId=i.mode==='all'?i.id:entries[0]!.form_id;
+    const removed=await db.query(`DELETE FROM form_entries WHERE guild_id=$1 AND ${i.mode==='one'?'id':'form_id'}=$2 AND state<>'draft' RETURNING id`,[i.guildId,i.id]);
+    if(removed.rowCount)await audit(db,i.guildId,i.actorId,'FORM_RESPONSES_DELETED',{form_id:formId,mode:i.mode,removed_entries:removed.rowCount,...(i.mode==='one'?{entry_id:i.id}:{})});
+    return {formId,count:removed.rowCount??0};
+  });
+}

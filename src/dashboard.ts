@@ -95,7 +95,7 @@ export function createDashboardHandler(options: Options) {
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
     const routes = ['/', '/dashboard', '/auth/discord', '/auth/discord/callback', '/auth/logout', '/settings', '/settings/test-log', '/cases', '/automod', '/honeypot', '/community', '/links', '/chat-clear', '/custom-commands', '/forms'];
-    const formsPath = /^\/forms(?:\/(?:responses|files|delete)\/[0-9a-f-]{36})?$/.test(path);
+    const formsPath = /^\/forms(?:\/(?:responses|files|delete|delete-response|delete-responses)\/[0-9a-f-]{36})?$/.test(path);
     const raidPath = /^\/raids(?:\/[^/]+)?$/.test(path);
     const starboardPath = /^\/starboards(?:\/[^/]+(?:\/(?:create|save|delete|delete-confirm))?)?$/.test(path);
     const starboardMutation = /^\/starboards\/[^/]+\/(?:create|save|delete)$/.test(path);

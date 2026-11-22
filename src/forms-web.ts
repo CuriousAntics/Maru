@@ -3,7 +3,7 @@ import type { ReadFormIdentity } from './form-responses.js';
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Pool } from 'pg';
-import { FormError, uuid, saveForm, saveAndPublishForm, reviewForm, deleteForm } from './forms.js';
+import { FormError, uuid, saveForm, saveAndPublishForm, reviewForm, deleteForm, deleteFormResponses, responseDeletionStamp } from './forms.js';
 import type { Form, Entry, Question, StaffContext } from './forms.js';
 import { equal, escapeHtml as e, formProof, logoutProof } from './web-security.js';
 import { layout } from './web-pages.js';
@@ -13,7 +13,7 @@ const types = {short:'Short answer',paragraph:'Paragraph',choice:'Multiple choic
 const blank = (): Question => ({label:'',type:'short',required:true,options:[]});
 const hidden = (name:string,value:unknown) => `<input type="hidden" name="${name}" value="${e(value)}">`;
 const time = (value:Date|null) => value?e(new Date(value).toISOString().replace('T',' ').slice(0,19))+' UTC':'—';
-const errors: Record<string,string> = {CLOSED:'Set Accept responses to On before publishing. Your edits are still shown below.',DELETE_CONFIRMATION:'Type DELETE and choose whether to keep or delete submitted responses.',INVALID_INPUT:'Check the title, questions and options. Choice questions need 2–10 distinct options. Required labels cannot be blank.',STALE:'This form or response changed. Reload before saving. Turn the form On before publishing.',SESSION_EXPIRED:'Sign in again before saving.',STAFF_REQUIRED:'Current staff access is required. Only Admins and Mods with full access can build and publish forms.',REQUEST_REJECTED:'Reload and use this page’s controls.',CHANNEL:'Choose an available channel with bot permissions.',LIMIT:'Up to 50 forms can be configured.',NOT_FOUND:'This item is unavailable.',BUSY:'Another change is running. Try again shortly.'};
+const errors: Record<string,string> = {RESPONSE_DELETE_CONFIRMATION:'Type DELETE to permanently delete responses and their uploaded files.',RESPONSES_CHANGED:'Responses changed since this confirmation opened. Review the updated count below before confirming again.',RESPONSE_DELETE_BUSY:'A decision DM is being sent. Wait a moment, then reload this confirmation before trying again.',CLOSED:'Set Accept responses to On before publishing. Your edits are still shown below.',DELETE_CONFIRMATION:'Type DELETE and choose whether to keep or delete submitted responses.',INVALID_INPUT:'Check the title, questions and options. Choice questions need 2–10 distinct options. Required labels cannot be blank.',STALE:'This form or response changed. Reload before saving. Turn the form On before publishing.',SESSION_EXPIRED:'Sign in again before saving.',STAFF_REQUIRED:'Current staff access is required. Only Admins and Mods with full access can build and publish forms.',REQUEST_REJECTED:'Reload and use this page’s controls.',CHANNEL:'Choose an available channel with bot permissions.',LIMIT:'Up to 50 forms can be configured.',NOT_FOUND:'This item is unavailable.',BUSY:'Another change is running. Try again shortly.'};
 async function params(request:IncomingMessage,o:Options): Promise<URLSearchParams> {
   if (request.headers.origin!==o.origin || request.headers['content-type']?.split(';')[0]?.trim()!=='application/x-www-form-urlencoded') throw new FormError('REQUEST_REJECTED');
   const chunks:Buffer[]=[]; let size=0;
@@ -28,6 +28,7 @@ function proof(p:URLSearchParams,o:Options,scope:string) {
 function revision(p:URLSearchParams) { const v=p.get('revision')??''; if (!/^(0|[1-9]\d{0,9})$/.test(v) || Number(v)>=2147483647) throw new FormError('INVALID_INPUT'); return Number(v); }
 export async function handleFormsPage(request:IncomingMessage,o:Options,views:Views) {
   const url=new URL(request.url??'/forms','http://localhost'),path=url.pathname;
+  const responseDeletion=/^\/forms\/(delete-response|delete-responses)\/([0-9a-f-]{36})$/.exec(path);
   const deletion=/^\/forms\/delete\/([0-9a-f-]{36})$/.exec(path);
   const detail=/^\/forms\/responses\/([0-9a-f-]{36})$/.exec(path),file=/^\/forms\/files\/([0-9a-f-]{36})$/.exec(path);
   let error:string|undefined,status=200,editor:Form|undefined,selectedChannel='',publicationId=randomUUID() as string;
@@ -41,7 +42,15 @@ export async function handleFormsPage(request:IncomingMessage,o:Options,views:Vi
   }
   try {
     if (request.method==='POST') {
-      const p=await params(request,o),rev=revision(p);
+      const p=await params(request,o);
+      if(responseDeletion) {
+        const mode=responseDeletion[1]==='delete-response'?'one':'all',id=responseDeletion[2]!,stamp=p.get('stamp')??'';
+        proof(p,o,`responses-delete:${mode}:${id}:${stamp}`);
+        if([...p.keys()].some(k=>!['csrf','stamp','confirmation'].includes(k)))throw new FormError('INVALID_INPUT');
+        const result=await deleteFormResponses(o.pool,{...o,id,mode,stamp,confirmation:p.get('confirmation')??''});
+        views.redirect('/forms?'+new URLSearchParams({status:'all',form:result.formId,view:'answers'}));return;
+      }
+      const rev=revision(p);
       if (deletion) {
         proof(p,o,`delete:${deletion[1]}:${rev}`);
         if ([...p.keys()].some(k=>!['csrf','revision','retention','confirmation'].includes(k))) throw new FormError('INVALID_INPUT');
@@ -101,6 +110,20 @@ export async function handleFormsPage(request:IncomingMessage,o:Options,views:Vi
       error=errors[err.code]??'This change could not be saved.';
     }
   }
+  if(responseDeletion) {
+    if(o.access!=='admin'){status=403;render('Full access required','<h1>Full access required</h1>');return;}
+    const mode=responseDeletion[1]==='delete-response'?'one':'all',id=responseDeletion[2]!;
+    const rows=uuid(id)?(await o.pool.query<Entry>(`SELECT id,form_id,revision,dm_status,user_id,username,display_name,identity_source FROM form_entries WHERE guild_id=$1 AND ${mode==='one'?'id':'form_id'}=$2 AND state<>'draft' ORDER BY id`,[o.guildId,id])).rows:[];
+    const formId=mode==='all'?id:rows[0]?.form_id;
+    const form=formId&&uuid(formId)?(await o.pool.query<Form>('SELECT * FROM forms WHERE guild_id=$1 AND id=$2',[o.guildId,formId])).rows[0]:undefined;
+    if(!form || mode==='one'&&!rows.length){status=404;render('Response unavailable','<h1>Response unavailable</h1><a href="/forms">Back to forms</a>');return;}
+    const stamp=responseDeletionStamp(rows),back='/forms?'+new URLSearchParams({status:'all',form:form.id,view:'answers'});
+    render('Delete responses',`<div class="hero"><h1>${mode==='one'?'Delete response':'Delete all responses'}?</h1><h2>${e(form.title)}</h2><p>Submitted responses to delete: ${rows.length}</p>
+      ${mode==='one'?`<div>Submitted by ${formUser(rows[0]!)}</div><p>Reference ${e(rows[0]!.id)}</p>`:'<p>This includes every pending, approved and rejected response for this form, across all pages, regardless of your current filters.</p>'}
+      <p>Answers, uploaded files and saved review details will be permanently deleted. This cannot be undone here. The form, its Discord posts and unfinished drafts remain. New responses can still be submitted while the form is open.</p><p>No deletion notification is sent. Queued decision DMs are cancelled; already delivered DMs remain in Discord.</p></div>
+      ${error?`<div class="notice" role="alert">${e(error)}</div>`:''}<section class="card">${rows.length?`<form method="post" action="${e(path)}">
+      ${hidden('csrf',formProof(o.token,`responses-delete:${mode}:${id}:${stamp}`))}${hidden('stamp',stamp)}<label for="confirmation">Type DELETE to confirm</label><input id="confirmation" name="confirmation" required pattern="DELETE" autocomplete="off"><p><button>${mode==='one'?'Permanently delete response':'Permanently delete all responses'}</button></p></form>`:'<p>No submitted responses remain to delete.</p>'}<a href="${e(mode==='one'?'/forms/responses/'+id:back)}">${rows.length?'Cancel':'Back to responses'}</a></section>`);return;
+  }
   if (deletion) {
     if (o.access!=='admin') {status=403;render('Staff access required','<h1>Full access required</h1>');return;}
     const f=uuid(deletion[1]!)?(await o.pool.query<Form>('SELECT * FROM forms WHERE guild_id=$1 AND id=$2 AND NOT deleted',[o.guildId,deletion[1]])).rows[0]:undefined;
@@ -122,7 +145,7 @@ export async function handleFormsPage(request:IncomingMessage,o:Options,views:Vi
     await enrichFormIdentities(o.pool,o.guildId,[entry],o.readIdentity);
     render('Form response',`<div class="hero"><h1>${e(entry.snapshot.title)}</h1><p>${e(entry.state)} · ${time(entry.submitted_at)}</p><div>Submitted by ${formUser(entry)}</div><p>Reference ${e(entry.id)}</p></div>${notice}
       ${entry.answers.map(a=>`<section class="card"><h2>${e(a.label)}</h2>${a.fileId?`<a href="/forms/files/${e(a.fileId)}">Download ${e(a.filename)}</a>`:`<p class="case-reason">${e(Array.isArray(a.value)?a.value.join('\n'):a.value||'No answer')}</p>`}</section>`).join('')}
-      ${entry.state==='pending'?`<section class="card"><h2>Review submission</h2><form method="post" action="${e(path)}">${hidden('csrf',formProof(o.token,`review:${entry.id}:${entry.revision}`))}${hidden('revision',entry.revision)}<label for="message">Optional message to the submitter</label><textarea id="message" name="message" maxlength="1000" rows="5"></textarea><p>This message and your decision will be sent by DM. It is visible to the submitter.</p><button name="decision" value="approved">Approve and notify</button> <button class="secondary" name="decision" value="rejected">Reject and notify</button></form></section>`:`<section class="card"><h2>Review result</h2><p>${e(entry.state)} by ${e(entry.reviewed_by)} · ${time(entry.reviewed_at)}</p><p class="case-reason">${e(entry.decision_message||'No additional message')}</p><p>Decision DM: ${e(entry.dm_status)}</p><p>Sent means Discord confirmed delivery. Failed means delivery was rejected. Unknown means it may have arrived; Maru will not automatically resend it.</p></section>`}<p><a href="/forms">Back to forms and responses</a></p>`);return;
+      ${entry.state==='pending'?`<section class="card"><h2>Review submission</h2><form method="post" action="${e(path)}">${hidden('csrf',formProof(o.token,`review:${entry.id}:${entry.revision}`))}${hidden('revision',entry.revision)}<label for="message">Optional message to the submitter</label><textarea id="message" name="message" maxlength="1000" rows="5"></textarea><p>This message and your decision will be sent by DM. It is visible to the submitter.</p><button name="decision" value="approved">Approve and notify</button> <button class="secondary" name="decision" value="rejected">Reject and notify</button></form></section>`:`<section class="card"><h2>Review result</h2><p>${e(entry.state)} by ${e(entry.reviewed_by)} · ${time(entry.reviewed_at)}</p><p class="case-reason">${e(entry.decision_message||'No additional message')}</p><p>Decision DM: ${e(entry.dm_status)}</p><p>Sent means Discord confirmed delivery. Failed means delivery was rejected. Unknown means it may have arrived; Maru will not automatically resend it.</p></section>`}${o.access==='admin'?`<section class="card"><h2>Delete response</h2><p>Permanently remove this response and its uploaded files.</p><a class="button" href="/forms/delete-response/${entry.id}">Delete response…</a></section>`:''}<p><a href="/forms">Back to forms and responses</a></p>`);return;
   }
   const allForms=(await o.pool.query<Form>('SELECT * FROM forms WHERE guild_id=$1 ORDER BY updated_at DESC,id',[o.guildId])).rows;
   const forms=allForms.filter(f=>!f.deleted);
@@ -170,5 +193,6 @@ export async function handleFormsPage(request:IncomingMessage,o:Options,views:Vi
     <section class="card"><h2>Your forms</h2>${o.access==='admin'?'<p><a class="button" href="/forms?new=1">Create form</a></p>':'<p>Admins and Mods with full access can create and publish forms. All configured staff can review responses.</p>'}
     ${forms.map(f=>`<p><a href="/forms?edit=${f.id}">${e(f.title)}</a> · ${f.enabled?'Open':'Closed'} · ${f.questions.length} questions · <a href="/forms?status=all&form=${f.id}&view=answers">Answers table</a></p>`).join('')||'<p>No forms yet.</p>'}</section>${editorHtml}
     <section class="card"><h2>Submissions</h2><form method="get" action="/forms"><label for="status">Status</label><select id="status" name="status">${['pending','approved','rejected','all'].map(s=>`<option${state===s?' selected':''}>${s}</option>`).join('')}</select><label for="form-filter">Form</label><select id="form-filter" name="form"><option value="">All forms</option>${allForms.map(f=>`<option value="${f.id}"${f.id===formFilter?' selected':''}>${e(f.title)}${f.deleted?' (deleted)':''}</option>`).join('')}</select><label for="view">View</label><select id="view" name="view"><option value="list"${view==='list'?' selected':''}>Submission list</option><option value="answers"${view==='answers'?' selected':''}>Answers table — choose one form</option></select><button>Filter responses</button></form>
+    ${selectedForm&&o.access==='admin'?`<p><a href="/forms/delete-responses/${selectedForm.id}">Delete all responses for ${e(selectedForm.title)}…</a></p>`:''}
     ${view==='answers'&&!selectedForm?'<p>Choose a form above to see its answers in a table.</p>':''}${responseTable||`<div class="table-wrap"><table><thead><tr><th>Form / reference</th><th>Discord user</th><th>Status / decision DM</th><th>Submitted</th></tr></thead><tbody>${entries.slice(0,50).map(r=>`<tr><td><a href="/forms/responses/${r.id}">${e(r.title)}</a><div class="small">${e(r.id)}</div></td><td>${formUser(r)}</td><td>${e(r.state)} · ${e(r.dm_status)}</td><td>${time(r.submitted_at)}</td></tr>`).join('')||'<tr><td colspan="4">No responses match this filter.</td></tr>'}</tbody></table></div>`}${entries.length>50?`<p><a href="/forms?${e(nextParams)}">Older responses</a></p>`:''}${page?`<p><a href="/forms?${e(new URLSearchParams({status:state,form:formFilter,view}))}">Newest responses</a></p>`:''}</section>`);
 }
