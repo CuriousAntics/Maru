@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net';
 import type { Pool } from 'pg';
 import type { Interaction } from 'discord.js';
 import { PGlite } from '@electric-sql/pglite';
-import { saveForm, startForm, loadDraft, submitFormStep, reviewForm, queueFormPost, validateForm, deleteForm, saveAndPublishForm } from '../src/forms.js';
+import { saveForm, startForm, loadDraft, submitFormStep, reviewForm, queueFormPost, validateForm, deleteForm, saveAndPublishForm, deleteFormResponses, responseDeletionStamp } from '../src/forms.js';
 import type { Form, Question, Answer, Entry } from '../src/forms.js';
 import { formModal, handleFormInteraction, downloadFormFile, formInteractionIdentity, formIdentityReader } from '../src/forms-discord.js';
 import { answerColumns, answersTable, enrichFormIdentities, formUser } from '../src/form-responses.js';
@@ -445,4 +445,109 @@ test('answers-table pagination retains its form, status and view filters',async(
   for(let n=0;n<51;n++)await query("INSERT INTO form_entries(guild_id,id,form_id,user_id,snapshot,answers,state,submitted_at,username,display_name,identity_source) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,'pending',NOW()-($7::integer*INTERVAL '1 second'),'mandy','Mandy','submission')",[guild,randomUUID(),id,user,snapshot,JSON.stringify([answer()]),n]);
   const html=await (await request('/forms?view=answers&status=pending&form='+id)).text();assert.match(html,new RegExp('form='+id+'&amp;view=answers&amp;page=1'));
   const next=await (await request('/forms?view=answers&status=pending&form='+id+'&page=1')).text();assert.match(next,/My answer/);assert.match(next,new RegExp('status=pending&amp;form='+id+'&amp;view=answers'));
+});
+
+async function deletionInput(mode:'one'|'all',target:string) {
+  const entries=(await query(`SELECT id,revision FROM form_entries WHERE guild_id=$1 AND ${mode==='one'?'id':'form_id'}=$2 AND state<>'draft'`,[guild,target])).rows as Entry[];
+  return {...context(),id:target,mode,stamp:responseDeletionStamp(entries),confirmation:'DELETE'};
+}
+async function deletionPost(path:string) {
+  const response=await request(path);assert.equal(response.status,200);const html=await response.text();
+  const value=(name:string)=>{const match=[...html.matchAll(new RegExp(`name="${name}" value="([^"]+)"`,'g'))].at(-1);assert.ok(match,name);return match[1]!;};
+  return new URLSearchParams({csrf:value('csrf'),stamp:value('stamp'),confirmation:'DELETE'});
+}
+test('delete one response removes answers, files, steps and queued DM while preserving form and other entries',async()=>{
+  const question=q({type:'file'});await save({questions:[question]});
+  const draft=await startForm(pool,guild,id,user),fileId=randomUUID();
+  const entry=await step(draft,[{...answer(question,''),fileId,filename:'delete.txt'}],[{id:fileId,filename:'delete.txt',data:Buffer.from('private bytes')}]);
+  const other=await startForm(pool,guild,id,actor);
+  await reviewForm(pool,{...context(),id:entry.id,revision:1,decision:'approved',message:'Private review'});
+  const input=await deletionInput('one',entry.id);const result=await deleteFormResponses(pool,input);
+  assert.equal(result.count,1);assert.equal(result.formId,id);assert.equal(await getEntry(entry.id),undefined);assert.ok(await getEntry(other.id));
+  assert.equal((await query('SELECT * FROM form_files')).rowCount,0);assert.equal((await query('SELECT * FROM form_steps')).rowCount,0);
+  assert.equal((await request('/forms/files/'+fileId)).status,404);assert.equal((await request('/forms/responses/'+entry.id)).status,404);
+  await deliverForms(pool,guild,deps);assert.deepEqual(deliveries,[]);
+  assert.equal((await query('SELECT enabled FROM forms')).rows[0].enabled,true);
+  const event=(await query("SELECT details FROM audit_events WHERE event_type='FORM_RESPONSES_DELETED'")).rows[0].details;
+  assert.deepEqual(event,{form_id:id,mode:'one',entry_id:entry.id,removed_entries:1});assert.doesNotMatch(JSON.stringify(event),/private|delete.txt|Private review/);
+  await assert.rejects(deleteFormResponses(pool,input),/NOT_FOUND/);
+});
+test('bulk deletion covers every page and status, preserves drafts, other forms and other guilds',async()=>{
+  const e=await submit();const draft=await startForm(pool,guild,id,actor);
+  await query(`INSERT INTO form_entries(guild_id,id,form_id,user_id,snapshot,state,submitted_at)
+    SELECT $1,gen_random_uuid(),$2,$3,$4::jsonb,CASE WHEN n%2=0 THEN 'approved' ELSE 'rejected' END,NOW() FROM generate_series(1,60) n`,[guild,id,user,JSON.stringify(e.snapshot)]);
+  const otherForm=randomUUID();await saveForm(pool,{...context(),id:otherForm,revision:0,form:config()});
+  const otherDraft=await startForm(pool,guild,otherForm,actor);const otherResponse=await step(otherDraft);
+  const otherGuild='100000000000000009';await query('INSERT INTO guild_settings(guild_id) VALUES ($1)',[otherGuild]);
+  await query("INSERT INTO forms(guild_id,id,title,description,questions,revision,updated_by) VALUES ($1,$2,'Other','',$3::jsonb,1,$4)",[otherGuild,id,JSON.stringify([q()]),actor]);
+  await query("INSERT INTO form_entries(guild_id,id,form_id,user_id,snapshot,state,submitted_at) VALUES ($1,$2,$3,$4,$5::jsonb,'pending',NOW())",[otherGuild,e.id,id,user,JSON.stringify(e.snapshot)]);
+  const result=await deleteFormResponses(pool,await deletionInput('all',id));assert.equal(result.count,61);
+  assert.ok(await getEntry(draft.id));assert.ok(await getEntry(otherResponse.id));assert.equal((await query('SELECT * FROM form_entries WHERE guild_id=$1',[otherGuild])).rowCount,1);
+  assert.equal((await query('SELECT enabled FROM forms WHERE guild_id=$1 AND id=$2',[guild,id])).rows[0].enabled,true);
+});
+test('retained responses can be deleted after their form is deleted',async()=>{
+  const e=await submit();await removeForm();
+  const html=await (await request('/forms?form='+id+'&status=all')).text();assert.match(html,new RegExp('/forms/delete-responses/'+id));
+  const path='/forms/delete-responses/'+id;assert.equal((await post(path,await deletionPost(path))).status,303);
+  assert.equal(await getEntry(e.id),undefined);assert.equal((await query('SELECT deleted FROM forms')).rows[0].deleted,true);
+});
+test('bulk confirmation rejects new submissions and review changes without removing any response',async()=>{
+  const e=await submit();let input=await deletionInput('all',id);
+  const another=await step(await startForm(pool,guild,id,actor));
+  await assert.rejects(deleteFormResponses(pool,input),/RESPONSES_CHANGED/);assert.ok(await getEntry(e.id));assert.ok(await getEntry(another.id));
+  input=await deletionInput('all',id);await reviewForm(pool,{...context(),id:e.id,revision:1,decision:'approved',message:''});
+  await assert.rejects(deleteFormResponses(pool,input),/RESPONSES_CHANGED/);assert.ok(await getEntry(e.id));
+});
+test('individual deletion rejects stale review revisions, drafts and cross-guild targets',async()=>{
+  const e=await submit(),input=await deletionInput('one',e.id);await reviewForm(pool,{...context(),id:e.id,revision:1,decision:'rejected',message:''});
+  await assert.rejects(deleteFormResponses(pool,input),/RESPONSES_CHANGED/);
+  const draft=await startForm(pool,guild,id,actor);await assert.rejects(deleteFormResponses(pool,await deletionInput('one',draft.id)),/NOT_FOUND/);
+  const otherGuild='100000000000000009';await query('INSERT INTO guild_settings(guild_id) VALUES ($1)',[otherGuild]);
+  await query("INSERT INTO dashboard_sessions(token_hash,guild_id,user_id,display_name,expires_at) VALUES ($1,$2,$3,'Other',NOW()+INTERVAL '1 hour')",[digest('other-token'),otherGuild,actor]);
+  await query("INSERT INTO staff_roles(guild_id,role_id,access_level) VALUES ($1,$2,'admin')",[otherGuild,admin]);
+  await assert.rejects(deleteFormResponses(pool,{...await deletionInput('one',e.id),guildId:otherGuild,token:'other-token'}),/NOT_FOUND/);
+});
+test('response deletion requires full access, a live session and explicit confirmation',async()=>{
+  const e=await submit(),input=await deletionInput('one',e.id);
+  for(const r of [null,[],[mod]]){roles=r;await assert.rejects(deleteFormResponses(pool,input),/STAFF_REQUIRED/);}
+  roles=[admin];for(const patch of [{confirmation:''},{confirmation:'delete'},{mode:'wrong'},{stamp:'bad'}])await assert.rejects(deleteFormResponses(pool,{...input,...patch} as typeof input),/RESPONSE_DELETE_CONFIRMATION/);
+  await query('DELETE FROM dashboard_sessions');await assert.rejects(deleteFormResponses(pool,input),/SESSION_EXPIRED/);assert.ok(await getEntry(e.id));
+});
+test('full-access Mods can delete responses',async()=>{
+  const e=await submit();roles=[mod];await query('INSERT INTO staff_access_grants(guild_id,user_id,granted_by) VALUES ($1,$2,$2)',[guild,actor]);
+  const path='/forms/delete-response/'+e.id;assert.equal((await post(path,await deletionPost(path))).status,303);assert.equal(await getEntry(e.id),undefined);
+});
+test('response deletion waits for sending DMs and audit failures roll back files and entries',async()=>{
+  const question=q({type:'file'});await save({questions:[question]});const draft=await startForm(pool,guild,id,user),fileId=randomUUID();
+  const e=await step(draft,[{...answer(question,''),fileId,filename:'keep.txt'}],[{id:fileId,filename:'keep.txt',data:Buffer.from('retain on rollback')}]);
+  await reviewForm(pool,{...context(),id:e.id,revision:1,decision:'approved',message:''});await query("UPDATE form_entries SET dm_status='sending'");
+  for(const mode of ['one','all'] as const)await assert.rejects(deleteFormResponses(pool,await deletionInput(mode,mode==='one'?e.id:id)),/RESPONSE_DELETE_BUSY/);
+  await query("UPDATE form_entries SET dm_status='pending'");const input=await deletionInput('all',id);failAudit=true;await assert.rejects(deleteFormResponses(pool,input),/audit failed/);failAudit=false;
+  assert.ok(await getEntry(e.id));assert.equal((await query('SELECT * FROM form_files')).rowCount,1);assert.equal((await query('SELECT * FROM form_steps')).rowCount,1);
+});
+test('HTTP deletion uses separate escaped confirmation pages and scope-specific CSRF proofs',async()=>{
+  const e=await submit();const path='/forms/delete-response/'+e.id,p=await deletionPost(path);
+  assert.ok(await getEntry(e.id));assert.match(await (await request('/forms/responses/'+e.id)).text(),new RegExp(path));
+  assert.equal((await post(path,p,'https://example.com')).status,403);
+  const wrong=new URLSearchParams(p);wrong.set('csrf',formProof(token,`review:${e.id}:1`));assert.equal((await post(path,wrong)).status,403);
+  wrong.set('csrf',p.get('csrf')!);wrong.set('confirmation','');assert.equal((await post(path,wrong)).status,409);
+  const extra=new URLSearchParams(p);extra.set('mode','all');assert.equal((await post(path,extra)).status,409);
+  const duplicate=new URLSearchParams(p);duplicate.append('confirmation','DELETE');assert.equal((await post(path,duplicate)).status,409);
+  assert.equal((await post('/forms/delete-responses/'+id,p)).status,403);
+  roles=[mod];assert.equal((await request(path)).status,403);assert.equal((await post(path,p)).status,403);
+  assert.doesNotMatch(await (await request('/forms/responses/'+e.id)).text(),/Delete response…/);
+  roles=[admin];assert.equal((await post(path,p)).status,303);assert.equal((await request(path)).status,404);
+});
+test('HTTP stale bulk confirmation shows new count and requires a new proof',async()=>{
+  const e=await submit();const path='/forms/delete-responses/'+id,old=await deletionPost(path);
+  await step(await startForm(pool,guild,id,actor));const response=await post(path,old),html=await response.text();
+  assert.equal(response.status,409);assert.match(html,/Responses changed/);assert.match(html,/Submitted responses to delete: 2/);assert.ok(await getEntry(e.id));
+  const p=await deletionPost(path);assert.equal((await post(path,p)).status,303);assert.equal((await query("SELECT * FROM form_entries WHERE state<>'draft'")).rowCount,0);
+  assert.equal((await post(path,old)).status,409);assert.doesNotMatch(await (await request(path)).text(),/Permanently delete all responses<\/button>/);
+});
+test('delete confirmation escapes titles and identities, missing bulk form returns 404',async()=>{
+  const e=await submit();await query("UPDATE forms SET title='<img src=x>' WHERE guild_id=$1 AND id=$2",[guild,id]);
+  await query("UPDATE form_entries SET username='<script>name',display_name='<img src=x>' WHERE guild_id=$1 AND id=$2",[guild,e.id]);
+  const html=await (await request('/forms/delete-response/'+e.id)).text();assert.doesNotMatch(html,/<img src=x>|<script>name/);assert.match(html,/&lt;img src=x&gt;/);
+  assert.equal((await request('/forms/delete-responses/'+randomUUID())).status,404);
 });

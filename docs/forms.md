@@ -122,3 +122,23 @@ Live checks: submit a form and verify the name, handle and ID on both the list a
 `maru-form-scroll-repair.patch` fixes scroll-position capture for forms with controls named `action` or `target`, including the form builder's Save and Publish buttons. Named controls mask native properties on HTMLFormElement; the script now reads the form's markup attributes instead. Regression tests model a single named control, multiple controls, and a named target, while retaining the existing destination and question-anchor behavior.
 
 Apply after the Forms controls update (PR #32). No database migration, dependency update or command registration is required. After deployment, scroll to the bottom of a multi-question form, click the lower Save form button and confirm it returns to that position. Also confirm Add question still brings the new card into view.
+
+## Delete submitted responses
+
+Admins and Mods with full access can delete responses without deleting the form:
+
+- Open a response from the submission list or answers table, then choose **Delete response…**.
+- Select a form in Submissions and click **Filter responses**, then choose **Delete all responses for [form]…**. This includes pending, approved and rejected responses across every page, regardless of the status filter. It also works for retained responses of a deleted form.
+
+Both options open a separate confirmation page showing the form, affected count and (for a single response) respondent/reference. Type `DELETE` and submit to permanently delete the answers, files and review details. No deletion notification is sent. Queued decision DMs are cancelled; already delivered Discord DMs remain. Deletion waits if a decision DM is currently being sent. The existing audit history remains; the new audit event records IDs/counts, never answers or file contents.
+
+The form, Discord posts and unfinished drafts remain. Members can still submit new responses to an open form. New submissions, reviews or other deletions after the confirmation page opens invalidate that confirmation: review the updated count and confirm again. No response is deleted on a GET, and request proofs are bound to the operation, target and exact response set. Deletion is transactional, including file cleanup and the audit event.
+
+No migration, dependency change, environment variable or Discord command registration is needed. Apply after the Save scroll repair (PR #33).
+
+Live checks with disposable data:
+
+1. Submit two responses, including a file upload. Delete one from its detail page. Confirm its detail/download links are unavailable, the second response remains, and the form stays open.
+2. Select the form with a status filter, choose bulk deletion, and confirm the page explicitly includes every status/page. Confirm deletion removes all submitted rows.
+3. Open a bulk confirmation, submit another response, then confirm on the old page. Verify the updated count is shown and nothing is removed until you confirm again.
+4. Delete retained responses of a previously deleted form. Ordinary Mods can still review but cannot delete responses.
