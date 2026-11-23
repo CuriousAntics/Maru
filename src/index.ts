@@ -1,3 +1,5 @@
+import { welcomeDependencies } from './welcome-discord.js';
+import { startWelcomeWorker } from './welcome.js';
 import { handleFormInteraction, formsDelivery, formIdentityReader } from './forms-discord.js';
 import { startFormsWorker } from './forms-worker.js';
 import { inlineCommandDependencies } from './inline-command-discord.js';
@@ -50,8 +52,9 @@ async function main(): Promise<void> {
     query_timeout: 5000,
   });
   const communityEvents = process.env.COMMUNITY_EVENTS_ENABLED === 'true';
+  const memberEvents = communityEvents || process.env.WELCOME_EVENTS_ENABLED === 'true';
   let communityConnected = false;
-  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent, ...(communityEvents ? [GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates] : [])] });
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent, ...(memberEvents ? [GatewayIntentBits.GuildMembers] : []), ...(communityEvents ? [GatewayIntentBits.GuildVoiceStates] : [])] });
   let stopping = false;
   let webConfig;
   try { webConfig = dashboardConfig(process.env); }
@@ -74,6 +77,7 @@ async function main(): Promise<void> {
   const banDeps = banDependencies(client, guildId, token, warningDeps);
   const scamFeed = createScamFeed(pool);
   const raidDeps = raidDependencies(client, guildId, token, communityEvents);
+  const welcomeDeps = welcomeDependencies(client, guildId, token, memberEvents);
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
     isBotReady: () => !stopping && client.isReady(),
@@ -84,6 +88,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    readWelcomeResources: welcomeDeps.resources,
     readFormIdentity: formIdentityReader(client, guildId),
     readChatClearResources: chatClearResources(client, guildId),
     raidDependencies: raidDeps,
@@ -102,6 +107,7 @@ async function main(): Promise<void> {
       }
     },
   });
+  const welcomeWorker = startWelcomeWorker(pool, guildId, welcomeDeps, () => memberEvents && !stopping && client.isReady());
   const formsWorker = startFormsWorker(pool, guildId, formsDelivery(token, readLogChannels, warningDeps.readActorRoles), () => !stopping && client.isReady());
   const starboardWorker = startStarboardWorker(pool, guildId, starboardRuntimeDependencies(client, guildId, token),
     () => !stopping && client.isReady());
@@ -132,6 +138,7 @@ async function main(): Promise<void> {
   client.on(Events.GuildAvailable, (guild) => { if (guild.id === guildId) { communityConnected = true; communityWorker.resetVoice(); } });
   client.on(Events.Raw, (packet) => {
     if (stopping) return;
+    welcomeWorker.accept(packet);
     inlineCommandWorker.accept(packet);
     communityWorker.accept(packet);
     honeypotWorker.accept(packet);
@@ -160,7 +167,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop(), inlineCommandWorker.stop(), formsWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop(), inlineCommandWorker.stop(), formsWorker.stop(), welcomeWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
