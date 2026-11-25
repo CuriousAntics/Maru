@@ -1,3 +1,5 @@
+import { announcementDependencies } from './announcement-discord.js';
+import { startAnnouncementWorker } from './announcements.js';
 import { welcomeDependencies } from './welcome-discord.js';
 import { startWelcomeWorker } from './welcome.js';
 import { handleFormInteraction, formsDelivery, formIdentityReader } from './forms-discord.js';
@@ -77,6 +79,7 @@ async function main(): Promise<void> {
   const banDeps = banDependencies(client, guildId, token, warningDeps);
   const scamFeed = createScamFeed(pool);
   const raidDeps = raidDependencies(client, guildId, token, communityEvents);
+  const announcementDeps = announcementDependencies(client, guildId, token);
   const welcomeDeps = welcomeDependencies(client, guildId, token, memberEvents);
   const dashboard = createDashboardHandler({
     pool, guildId, config: webConfig,
@@ -88,6 +91,7 @@ async function main(): Promise<void> {
       return { id: message.id, channel_id: message.channel_id };
     },
     readLogChannels,
+    announcementDependencies: announcementDeps,
     readWelcomeResources: welcomeDeps.resources,
     readFormIdentity: formIdentityReader(client, guildId),
     readChatClearResources: chatClearResources(client, guildId),
@@ -107,6 +111,7 @@ async function main(): Promise<void> {
       }
     },
   });
+  const announcementWorker = startAnnouncementWorker(pool, guildId, announcementDeps, () => !stopping && client.isReady());
   const welcomeWorker = startWelcomeWorker(pool, guildId, welcomeDeps, () => memberEvents && !stopping && client.isReady());
   const formsWorker = startFormsWorker(pool, guildId, formsDelivery(token, readLogChannels, warningDeps.readActorRoles), () => !stopping && client.isReady());
   const starboardWorker = startStarboardWorker(pool, guildId, starboardRuntimeDependencies(client, guildId, token),
@@ -167,7 +172,7 @@ async function main(): Promise<void> {
     stopping = true;
     const deadline = setTimeout(() => process.exit(exitCode || 1), 10000);
     deadline.unref();
-    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop(), inlineCommandWorker.stop(), formsWorker.stop(), welcomeWorker.stop()]);
+    const stoppedWorkers = await Promise.allSettled([starboardWorker.stop(), autoModWorker.stop(), honeypotWorker.stop(), communityWorker.stop(), raidWorker.stop(), scamFeedWorker.stop(), chatClearWorker.stop(), customCommandWorker.stop(), inlineCommandWorker.stop(), formsWorker.stop(), welcomeWorker.stop(), announcementWorker.stop()]);
     if (stoppedWorkers.some((result) => result.status === 'rejected')) console.error('An automation worker could not finish shutdown; review saved work after restart.');
     await client.destroy();
     await Promise.allSettled([
